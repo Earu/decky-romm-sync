@@ -52,6 +52,9 @@ if TYPE_CHECKING:
     from services.protocols import EventEmitter
 
 
+_SYNC_DISABLED_MSG = "Save sync is disabled"
+
+
 class SaveService:
     """Bidirectional save file sync between local RetroDECK and RomM server.
 
@@ -1242,7 +1245,7 @@ class SaveService:
     async def sync_rom_saves(self, rom_id: int) -> dict:
         """Bidirectional sync for a single ROM (manual trigger from game detail)."""
         if not self._is_save_sync_enabled():
-            return {"success": False, "message": "Save sync is disabled", "synced": 0}
+            return {"success": False, "message": _SYNC_DISABLED_MSG, "synced": 0}
 
         if not self._save_sync_state.get("device_id"):
             reg = self.ensure_device_registered()
@@ -1300,7 +1303,8 @@ class SaveService:
         # Merge: update persisted slots with server data, promote local→server
         merged: dict[str, dict] = {}
         for s in server_slots_list:
-            name = s.get("slot") or s.get("slot_name") or "default"
+            raw = s.get("slot") or s.get("slot_name")
+            name = raw if raw else ""
             merged[name] = {
                 "source": "server",
                 "count": s.get("count", 0),
@@ -1315,7 +1319,7 @@ class SaveService:
                     merged[name] = {"source": "local", "count": 0, "latest_updated_at": None}
                 # If it was "server" but is gone from server now — drop it
                 # (unless it's the active_slot)
-                elif info.get("source") == "server" and name == active_slot:
+                elif info.get("source") == "server" and name == (active_slot or ""):
                     merged[name] = {"source": "server", "count": 0, "latest_updated_at": None}
 
         # Persist merged slots in state
@@ -1336,6 +1340,41 @@ class SaveService:
 
         return {"success": True, "slots": result_slots, "active_slot": active_slot}
 
+    async def get_slot_saves(self, rom_id: int, slot: str) -> dict:
+        """Fetch server save files for a specific slot.
+
+        Used by the frontend to show save files when expanding an inactive slot panel.
+        Lightweight — no local file scanning or conflict detection.
+        """
+        rom_id = int(rom_id)
+        slot = str(slot).strip() if slot else ""
+
+        if not self._is_save_sync_enabled():
+            return {"success": False, "slot": slot, "saves": [], "error": _SYNC_DISABLED_MSG}
+
+        device_id = self._get_server_device_id()
+
+        try:
+            server_saves: list[dict] = await self._loop.run_in_executor(
+                None,
+                lambda: self._retry.with_retry(
+                    lambda: self._romm_api.list_saves(rom_id, device_id=device_id, slot=slot),
+                ),
+            )
+            saves = [
+                {
+                    "filename": s["file_name"],
+                    "id": s["id"],
+                    "size": s.get("file_size_bytes"),
+                    "updated_at": s.get("updated_at", ""),
+                    "emulator": s.get("emulator", ""),
+                }
+                for s in server_saves
+            ]
+            return {"success": True, "slot": slot, "saves": saves}
+        except Exception as e:
+            return {"success": False, "slot": slot, "saves": [], "error": str(e)}
+
     def set_game_slot(self, rom_id: int, slot: str) -> dict:
         """Set the active save slot for a specific game.
 
@@ -1355,15 +1394,171 @@ class SaveService:
         else:
             saves[rom_id_str]["active_slot"] = resolved_slot
 
-        # Ensure slot is in the persisted slots dict (skip for None/legacy)
-        if resolved_slot is not None:
-            slots_dict: dict[str, dict] = saves[rom_id_str].setdefault("slots", {})
-            if resolved_slot not in slots_dict:
-                slots_dict[resolved_slot] = {"source": "local", "count": 0, "latest_updated_at": None}
+        # Ensure slot is in the persisted slots dict (use "" as key for legacy/None)
+        slot_key = resolved_slot if resolved_slot is not None else ""
+        slots_dict: dict[str, dict] = saves[rom_id_str].setdefault("slots", {})
+        if slot_key not in slots_dict:
+            slots_dict[slot_key] = {"source": "local", "count": 0, "latest_updated_at": None}
 
         self.save_state()
         self._loop.create_task(self.check_save_status_background(rom_id))
         return {"success": True, "active_slot": resolved_slot}
+
+    def _check_slot_switch_readiness(self, rom_id: int) -> dict:
+        """Check whether it is safe to switch slots for this ROM.
+
+        A switch is unsafe if local files have changed since the last sync
+        to the current slot — those changes would be lost.
+        Files that were never synced do not block (they'll be deleted on switch).
+
+        Returns ``{"ready": True}`` or
+        ``{"ready": False, "reason": str, "files": list[str]}``.
+        """
+        rom_id_str = str(rom_id)
+        save_state = self._save_sync_state["saves"].get(rom_id_str, {})
+        files_state = save_state.get("files", {})
+
+        pending: list[str] = []
+        local_files = self._find_save_files(rom_id)
+        for lf in local_files:
+            filename = lf["filename"]
+            file_state = files_state.get(filename, {})
+            last_sync_hash = file_state.get("last_sync_hash")
+            if last_sync_hash:
+                current_hash = self._file_md5(lf["path"])
+                if current_hash != last_sync_hash:
+                    pending.append(filename)
+
+        if pending:
+            return {"ready": False, "reason": "pending_uploads", "files": pending}
+
+        return {"ready": True}
+
+    async def switch_slot(self, rom_id: int, new_slot: str) -> dict:
+        """Switch the active save slot with immediate state sync.
+
+        Pre-checks (all must pass):
+        1. Save sync must be enabled.
+        2. ROM must be installed.
+        3. No local files with pending changes (changed since last sync to current slot).
+        4. Server must be reachable.
+
+        On success:
+        - If the new slot has server saves: downloads them, replacing local files.
+        - If the new slot is empty: deletes local save files (fresh start).
+        - Never uploads — saves are not carried between slots.
+        """
+        rom_id = int(rom_id)
+        rom_id_str = str(rom_id)
+
+        # 1. Save sync must be enabled
+        if not self._is_save_sync_enabled():
+            return {"success": False, "reason": "sync_disabled"}
+
+        # 2. Slot normalisation (empty → None for legacy mode)
+        slot_str = str(new_slot).strip() if new_slot else ""
+        resolved_slot: str | None = slot_str if slot_str else None
+
+        # 3. ROM must be installed
+        info = self._get_rom_save_info(rom_id)
+        if not info:
+            return {"success": False, "reason": "not_installed"}
+
+        saves_dir = info["saves_dir"]
+        system = info["system"]
+
+        # 4. Check for pending local changes (hashing — run in executor)
+        readiness = await self._loop.run_in_executor(None, self._check_slot_switch_readiness, rom_id)
+        if not readiness.get("ready"):
+            return {
+                "success": False,
+                "reason": readiness.get("reason", "pending_uploads"),
+                "files": readiness.get("files", []),
+            }
+
+        # 5. Fetch server saves for the new slot (also proves server is reachable)
+        device_id = self._get_server_device_id()
+        try:
+            all_server_saves: list[dict] = await self._loop.run_in_executor(
+                None,
+                lambda: self._retry.with_retry(
+                    lambda: self._romm_api.list_saves(rom_id, device_id=device_id),
+                ),
+            )
+        except Exception:
+            return {"success": False, "reason": "server_unreachable"}
+
+        # Filter to the target slot (FakeSaveApi doesn't filter, real API may not either)
+        # Normalize "" and None both to None before comparing (legacy saves may use either)
+        slot_saves = [s for s in all_server_saves if (s.get("slot") or None) == resolved_slot]
+
+        # 6. Update active slot in state
+        self.set_game_slot(rom_id, new_slot)
+
+        # 7. Sync local state to match the new slot
+        if slot_saves:
+            # New slot has server saves — download them, replacing local files
+            await self._loop.run_in_executor(
+                None,
+                self._do_switch_downloads,
+                slot_saves,
+                saves_dir,
+                rom_id_str,
+                system,
+            )
+        else:
+            # New slot is empty — delete local save files for a fresh start
+            await self._loop.run_in_executor(
+                None,
+                self._delete_local_saves_for_switch,
+                rom_id,
+                rom_id_str,
+            )
+
+        # 8. Update last_sync_check_at
+        save_entry = self._save_sync_state["saves"].setdefault(rom_id_str, {})
+        save_entry["last_sync_check_at"] = datetime.now(UTC).isoformat()
+        self.save_state()
+
+        # 9. Return fresh status
+        save_status = await self.get_save_status(rom_id)
+        return {"success": True, "save_status": save_status}
+
+    def _do_switch_downloads(
+        self,
+        slot_saves: list[dict],
+        saves_dir: str,
+        rom_id_str: str,
+        system: str,
+    ) -> None:
+        """Download all saves from *slot_saves* into *saves_dir*.
+
+        Runs synchronously — call via ``run_in_executor``.
+        """
+        for server_save in slot_saves:
+            filename = server_save.get("file_name", "")
+            if not filename:
+                continue
+            self._do_download_save(server_save, saves_dir, filename, rom_id_str, system)
+
+    def _delete_local_saves_for_switch(self, rom_id: int, rom_id_str: str) -> None:
+        """Delete local save files and clear file tracking state for a slot switch.
+
+        Unlike delete_local_saves (the callable), this preserves slot config
+        (active_slot, slot_confirmed, slots dict) and only clears files + tracking.
+        Runs synchronously — call via run_in_executor.
+        """
+        local_files = self._find_save_files(rom_id)
+        for lf in local_files:
+            try:
+                os.remove(lf["path"])
+                self._log_debug(f"Deleted local save for switch: {lf['filename']}")
+            except Exception as e:
+                self._log_debug(f"Failed to delete {lf['filename']} during switch: {e}")
+
+        # Clear file tracking state (but keep slot config)
+        save_entry = self._save_sync_state.get("saves", {}).get(rom_id_str, {})
+        save_entry["files"] = {}
 
     # ------------------------------------------------------------------
     # Save Setup Wizard
@@ -1573,7 +1768,7 @@ class SaveService:
     async def sync_all_saves(self) -> dict:
         """Manual full sync of all ROMs with shortcuts (both directions)."""
         if not self._is_save_sync_enabled():
-            return {"success": False, "message": "Save sync is disabled", "synced": 0, "conflicts": 0}
+            return {"success": False, "message": _SYNC_DISABLED_MSG, "synced": 0, "conflicts": 0}
 
         if not self._save_sync_state.get("device_id"):
             reg = self.ensure_device_registered()
