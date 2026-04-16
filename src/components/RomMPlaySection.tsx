@@ -197,7 +197,8 @@ function computeSaveSyncDisplay(saveStatus: SaveStatus | null): { status: "synce
   return { status: "none", label: "No saves" };
 }
 
-import { setRommConnectionState } from "../utils/connectionState";
+import { setRommConnectionState, setVersionError } from "../utils/connectionState";
+import { useVersionError } from "./VersionErrorCard";
 
 /** Extract BIOS fields from a bios_status response into an InfoState partial. */
 function extractBiosInfo(b: BiosStatus): Partial<InfoState> {
@@ -246,6 +247,9 @@ function refreshBiosInBackground(
 }
 
 export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => {
+  // Subscribe to version error — re-renders when global state changes
+  const versionError = useVersionError();
+
   // Read playtime from Steam's own overview synchronously (already written by metadataPatches)
   // This avoids an unnecessary render from setting it inside the async effect.
   const overview = appStore.GetAppOverviewByAppID(appId);
@@ -473,6 +477,13 @@ export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => {
       try {
         const result = await Promise.race([testConnection(), timeoutMs(5000)]);
         if (cancelled) return;
+        if (result.error_code === "version_error") {
+          setVersionError(result.message);
+          setRommConnectionState("offline");
+          setConnectionState("offline");
+          globalThis.dispatchEvent(new CustomEvent("romm_connection_changed", { detail: { state: "offline" } }));
+          return;
+        }
         const connected = result.success;
         const connState = connected ? "connected" : "offline";
         setRommConnectionState(connState);
@@ -736,6 +747,11 @@ export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => {
       (e.currentTarget ?? e.target) as HTMLElement,
     );
   };
+
+  // Version mismatch — render nothing (VersionErrorCard is shown in RomMGameInfoPanel instead)
+  if (versionError) {
+    return null;
+  }
 
   // Build info items array
   const infoItems: ReturnType<typeof createElement>[] = [];

@@ -30,6 +30,8 @@ import { getDownloadState } from "../utils/downloadStore";
 import { getMigrationState, onMigrationChange, setMigrationStatus } from "../utils/migrationStore";
 import { getSaveSortMigrationState, onSaveSortMigrationChange, setSaveSortMigrationStatus } from "../utils/saveSortMigrationStore";
 import { requestSyncCancel } from "../utils/syncManager";
+import { setVersionError } from "../utils/connectionState";
+import { VersionErrorCard, useVersionError } from "./VersionErrorCard";
 import type { SyncProgress, SyncStats, SyncPreview, SyncPreviewSummary, DownloadItem } from "../types";
 import type { MigrationStatus } from "../api/backend";
 
@@ -48,6 +50,61 @@ function formatBytes(bytes: number): string {
 
 function formatChanges(pairs: [number, string][]): string {
   return pairs.filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`).join(", ");
+}
+
+const ConnectionIndicator: FC<{ connected: boolean | null }> = ({ connected }) => {
+  if (connected === null) {
+    return (
+      <>
+        <Spinner width={14} height={14} />
+        <span style={{ fontSize: "12px", opacity: 0.7 }}>Checking...</span>
+      </>
+    );
+  }
+  if (connected) {
+    return (
+      <>
+        <FaCheckCircle style={{ color: "#59bf40", fontSize: "14px" }} />
+        <span style={{ fontSize: "12px" }}>Connected</span>
+      </>
+    );
+  }
+  return (
+    <>
+      <FaTimesCircle style={{ color: "#d4343c", fontSize: "14px" }} />
+      <span style={{ fontSize: "12px" }}>Not connected</span>
+    </>
+  );
+};
+
+function formatProgressText(progress: SyncProgress | null): string {
+  if (!progress) return "Syncing...";
+  const step = progress.step && progress.totalSteps
+    ? `[${progress.step}/${progress.totalSteps}] `
+    : "";
+  const msg = progress.message || "Syncing...";
+  // Truncate to ~40 chars to prevent multi-line jumping in the QAM panel
+  const maxLen = 40 - step.length;
+  const truncated = msg.length > maxLen ? msg.slice(0, maxLen - 1) + "\u2026" : msg;
+  return step + truncated;
+}
+
+function formatLastSync(iso: string | null): string {
+  if (!iso) return "Never";
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    return `${diffDays}d ago`;
+  } catch {
+    return iso;
+  }
 }
 
 function formatPreviewDescription(s: SyncPreviewSummary): string {
@@ -70,6 +127,7 @@ function formatPreviewDescription(s: SyncPreviewSummary): string {
 export const MainPage: FC<MainPageProps> = ({ onNavigate }) => {
   const [stats, setStats] = useState<SyncStats | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
+  const versionError = useVersionError();
   const [syncing, setSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [status, setStatus] = useState("");
@@ -118,7 +176,10 @@ export const MainPage: FC<MainPageProps> = ({ onNavigate }) => {
       })
       .catch((e) => logError(`Failed to refresh migration state: ${e}`));
     getSyncStats().then(setStats);
-    testConnection().then((r) => setConnected(r.success));
+    testConnection().then((r) => {
+      setConnected(r.success);
+      setVersionError(r.error_code === "version_error" ? r.message : null);
+    });
     getSettings().then((s) => {
       if (s.retroarch_input_check) {
         setRetroarchWarning(s.retroarch_input_check);
@@ -251,39 +312,13 @@ export const MainPage: FC<MainPageProps> = ({ onNavigate }) => {
     ? ((syncProgress.current ?? 0) / syncProgress.total) * 100
     : undefined;
 
-  const formatProgressText = (progress: SyncProgress | null): string => {
-    if (!progress) return "Syncing...";
-    const step = progress.step && progress.totalSteps
-      ? `[${progress.step}/${progress.totalSteps}] `
-      : "";
-    const msg = progress.message || "Syncing...";
-    // Truncate to ~40 chars to prevent multi-line jumping in the QAM panel
-    const maxLen = 40 - step.length;
-    const truncated = msg.length > maxLen ? msg.slice(0, maxLen - 1) + "\u2026" : msg;
-    return step + truncated;
-  };
-
-  const formatLastSync = (iso: string | null): string => {
-    if (!iso) return "Never";
-    try {
-      const d = new Date(iso);
-      const now = new Date();
-      const diffMs = now.getTime() - d.getTime();
-      const diffMins = Math.floor(diffMs / 60000);
-      if (diffMins < 1) return "Just now";
-      if (diffMins < 60) return `${diffMins}m ago`;
-      const diffHours = Math.floor(diffMins / 60);
-      if (diffHours < 24) return `${diffHours}h ago`;
-      const diffDays = Math.floor(diffHours / 24);
-      return `${diffDays}d ago`;
-    } catch {
-      return iso;
-    }
-  };
-
   const activeDownloads = downloads.filter(d => d.status === "queued" || d.status === "downloading");
   const completedDownloads = downloads.filter(d => d.status === "completed" || d.status === "failed" || d.status === "cancelled");
   const hasDownloads = activeDownloads.length > 0 || completedDownloads.length > 0;
+
+  if (versionError) {
+    return <VersionErrorCard message={versionError} compact />;
+  }
 
   return (
     <>
@@ -293,22 +328,7 @@ export const MainPage: FC<MainPageProps> = ({ onNavigate }) => {
             label="Connection"
           >
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              {connected === null ? (
-                <>
-                  <Spinner width={14} height={14} />
-                  <span style={{ fontSize: "12px", opacity: 0.7 }}>Checking...</span>
-                </>
-              ) : connected ? (
-                <>
-                  <FaCheckCircle style={{ color: "#59bf40", fontSize: "14px" }} />
-                  <span style={{ fontSize: "12px" }}>Connected</span>
-                </>
-              ) : (
-                <>
-                  <FaTimesCircle style={{ color: "#d4343c", fontSize: "14px" }} />
-                  <span style={{ fontSize: "12px" }}>Not connected</span>
-                </>
-              )}
+              <ConnectionIndicator connected={connected} />
             </div>
           </Field>
         </PanelSectionRow>

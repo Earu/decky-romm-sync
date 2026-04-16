@@ -30,18 +30,17 @@ import {
   getAchievementProgress,
   getSaveSlots,
   isSaveTrackingConfigured,
-  getServerCapabilities,
   debugLog,
   refreshMigrationState,
   logError,
 } from "../api/backend";
-import type { ServerCapabilities } from "../api/backend";
 import { SlotSetupWizard } from "./SlotSetupWizard";
 import { SavesTab } from "./SavesTab";
 import type { RomMetadata, InstalledRom, BiosStatus, SaveStatus, PendingConflict, Achievement, AchievementProgress, EarnedAchievement, SaveSlotSummary } from "../types";
 import { getMigrationState, onMigrationChange, setMigrationStatus } from "../utils/migrationStore";
 import { getSaveSortMigrationState, onSaveSortMigrationChange, setSaveSortMigrationStatus } from "../utils/saveSortMigrationStore";
 import { scrollFocusedToCenter } from "../utils/scrollHelpers";
+import { VersionErrorCard, useVersionError } from "./VersionErrorCard";
 
 interface RomMGameInfoPanelProps {
   appId: number;
@@ -71,7 +70,6 @@ interface PanelState {
   activeSlot: string | null;
   availableSlots: SaveSlotSummary[];
   slotsLoading: boolean;
-  capabilities: ServerCapabilities;
 }
 
 /** Format a Unix timestamp (seconds) as a release date string (e.g. "15 Mar 2003") */
@@ -105,12 +103,8 @@ function refreshSlotState(
 }
 
 export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
-  const defaultCapabilities: ServerCapabilities = {
-    device_sync: false,
-    version_history: false,
-    slot_deletion: false,
-    device_management: false,
-  };
+  // Subscribe to version error — re-renders when global state changes
+  const versionError = useVersionError();
 
   const [state, setState] = useState<PanelState>({
     loading: true,
@@ -136,7 +130,6 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
     activeSlot: "default",
     availableSlots: [],
     slotsLoading: false,
-    capabilities: defaultCapabilities,
   });
   const romIdRef = useRef<number | null>(null);
   const [migrationPending, setMigrationPending] = useState(getMigrationState().pending);
@@ -242,7 +235,6 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
           activeSlot: "default",
           availableSlots: [],
           slotsLoading: false,
-          capabilities: defaultCapabilities,
         });
 
         // Check if save slot tracking is configured for this game
@@ -286,17 +278,7 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
           );
         }
 
-        // Server capabilities (for save sync feature gating)
-        let fetchedCaps: ServerCapabilities | null = null;
-        if (cached.save_sync_enabled) {
-          bgPromises.push(getServerCapabilities().then((c) => { fetchedCaps = c; }).catch(() => {}));
-        }
-
         await Promise.all(bgPromises);
-
-        if (!cancelled && fetchedCaps) {
-          setState((prev) => ({ ...prev, capabilities: fetchedCaps! }));
-        }
       } catch (e) {
         debugLog(`RomMGameInfoPanel: loadData error: ${e}`);
         if (!cancelled) setState((prev) => ({ ...prev, loading: false, error: true }));
@@ -488,6 +470,15 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
       title ? createElement("div", { className: "romm-panel-section-title" }, title) : null,
       ...children.filter(Boolean),
     );
+
+  // --- Version mismatch — replace entire panel with polished error card ---
+  if (versionError) {
+    return createElement(
+      "div",
+      { "data-romm": "true" },
+      createElement(VersionErrorCard, { message: versionError }),
+    );
+  }
 
   // --- Loading state ---
   // Use minHeight so Steam's scroll container allocates enough space
@@ -1037,7 +1028,6 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => {
         activeSlot: state.activeSlot,
         availableSlots: state.availableSlots,
         slotsLoading: state.slotsLoading,
-        capabilities: state.capabilities,
         onSlotSwitched: (newSlot, newStatus) => {
           setState((prev) => ({
             ...prev,
