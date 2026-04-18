@@ -76,6 +76,42 @@ function pickLastSyncer(syncs: DeviceSyncInfo[] | undefined): DeviceSyncInfo | n
   }, null);
 }
 
+/**
+ * Return an attribution label based on the uploaded_by_us flag, or null if unknown.
+ * NOTE: "this device" is really "this plugin installation" — if state.json is
+ * copied to another machine, the label would incorrectly claim local ownership.
+ */
+function attributionLabel(uploadedByUs: boolean | null | undefined): string | null {
+  if (uploadedByUs === true) return "(this device)";
+  if (uploadedByUs === false) return "(not this device)";
+  return null;
+}
+
+/**
+ * Format the per-save attribution+checkmark segment for the sync-time line.
+ *
+ * Combines device name, attribution label, and the trailing checkmark into
+ * one ready-to-render string, or null when nothing meaningful can be shown.
+ * Reused between `renderSaveFileRow` and `renderVersionRow`.
+ */
+function formatAttributionSegment(
+  uploadedByUs: boolean | null | undefined,
+  deviceName: string | null | undefined,
+): string | null {
+  const label = attributionLabel(uploadedByUs);
+  if (uploadedByUs === true) {
+    return deviceName ? `${deviceName} ${label} \u2713` : `${label} \u2713`;
+  }
+  if (uploadedByUs === false) {
+    // Intentionally no device name — lastSyncer is our own sync record, not the actual uploader
+    return `${label} \u2713`;
+  }
+  if (label === null) {
+    return deviceName ? `${deviceName} \u2713` : `\u2713`;
+  }
+  return null;
+}
+
 /** Map a save file status to color and label */
 function statusLabel(status: string, lastSyncAt: string | null): { color: string; label: string } {
   switch (status) {
@@ -219,9 +255,10 @@ const VersionHistoryPanel: FC<VersionHistoryPanelProps> = ({
     if (v.emulator) headerParts.push(v.emulator);
     if (v.file_size_bytes != null) headerParts.push(formatBytes(v.file_size_bytes));
 
-    // Line 2: Last updated: <timestamp>[ · <device>]
+    // Line 2: Last updated: <timestamp>[ · <device label> ✓]  — see formatAttributionSegment
     const lastUpdatedParts: string[] = [formatTimestamp(v.updated_at)];
-    if (deviceName) lastUpdatedParts.push(`${deviceName} \u2713`);
+    const attrSegment = formatAttributionSegment(v.uploaded_by_us, deviceName);
+    if (attrSegment !== null) lastUpdatedParts.push(attrSegment);
 
     return createElement("div", {
       key: `ver-${v.id}`,
@@ -381,16 +418,10 @@ function renderSaveFileRow(
     style: { color, fontSize: "11px", fontWeight: 600 },
   }, label));
 
-  // Last synced value: "just now · steamdeck ✓"
-  const lastSyncedPieces: string[] = [];
-  if (syncTime) {
-    lastSyncedPieces.push(formatRelativeTime(syncTime) || "Never");
-  } else {
-    lastSyncedPieces.push("Never");
-  }
-  if (lastSyncer?.device_name) {
-    lastSyncedPieces.push(`${lastSyncer.device_name} \u2713`);
-  }
+  // Last synced value: "just now · <attribution> ✓" — see formatAttributionSegment
+  const lastSyncedPieces: string[] = [syncTime ? (formatRelativeTime(syncTime) || "Never") : "Never"];
+  const attrSegment = formatAttributionSegment(f.uploaded_by_us, lastSyncer?.device_name);
+  if (attrSegment !== null) lastSyncedPieces.push(attrSegment);
   if (f.is_current === false) {
     lastSyncedPieces.push("Newer version available on server");
   }

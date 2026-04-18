@@ -116,6 +116,33 @@ export const saveShortcutIcon = callable<[number, string], { success: boolean }>
 
 // Save sync callables
 export const ensureDeviceRegistered = callable<[], { success: boolean; device_id: string; device_name: string }>("ensure_device_registered");
+
+export interface RegisteredDevice {
+  id: string;
+  name: string | null;
+  platform: string | null;
+  client: string | null;
+  client_version: string | null;
+  last_seen: string | null;
+  created_at: string;
+  is_current_device: boolean;
+  user_id?: number;
+  ip_address?: string | null;
+  mac_address?: string | null;
+  hostname?: string | null;
+  sync_mode?: string | null;
+  sync_enabled?: boolean;
+  updated_at?: string | null;
+}
+
+export interface ListDevicesResponse {
+  success: boolean;
+  devices: RegisteredDevice[];
+  disabled?: boolean;
+  error?: string;
+}
+
+export const listDevices = callable<[], ListDevicesResponse>("list_devices");
 export const getSaveStatus = callable<[number], SaveStatus>("get_save_status");
 export const preLaunchSync = callable<[number], { success: boolean; message: string; synced?: number; errors?: string[]; conflicts?: (PendingConflict | NewerInSlotConflict)[] }>("pre_launch_sync");
 export const postExitSync = callable<[number], { success: boolean; message: string; synced?: number; errors?: string[]; conflicts?: (PendingConflict | NewerInSlotConflict)[]; offline?: boolean }>("post_exit_sync");
@@ -224,6 +251,7 @@ export interface SaveVersionEntry {
   updated_at: string;
   file_size_bytes: number | null;
   device_syncs: Array<{ device_id: string; device_name: string; is_current: boolean; last_synced_at: string | null }>;
+  uploaded_by_us?: boolean | null;
 }
 
 export type RollbackStatus =
