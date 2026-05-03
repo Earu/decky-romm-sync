@@ -1,8 +1,6 @@
 import asyncio
 import json
 import logging
-import os
-import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -303,62 +301,6 @@ class TestPostExitSync:
     #     migration resolver would pick that fresh download over the real
     #     user progress at the new layout.
     # ------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_post_exit_sync_mid_session_sort_change_preserves_user_progress(self, plugin, tmp_path):
-        """Mid-session sort change: save at previous layout must be uploaded, no stale download (#238)."""
-        _install_rom(plugin, tmp_path)
-        # Force local_wins so a conflict (fresh local vs stale server) cleanly
-        # resolves to an upload rather than dropping into ask_me.
-        plugin._save_sync_state["settings"]["conflict_mode"] = "local_wins"
-        # Session just ended: user flipped sort_by_content mid-game.
-        # PREVIOUS layout (OLD) — where RetroArch actually wrote the save:
-        #   saves/gba/pokemon.srm (sort_by_content=True)
-        # CURRENT layout (NEW) — where the current settings would look:
-        #   saves/pokemon.srm (sort_by_content=False)
-        plugin._state["save_sort_settings"] = {"sort_by_content": False, "sort_by_core": False}
-        plugin._state["save_sort_settings_previous"] = {"sort_by_content": True, "sort_by_core": False}
-
-        # Real user progress at PREVIOUS layout — this is the byte content we
-        # must protect at all costs.
-        prev_save_path = tmp_path / "retrodeck" / "saves" / "gba" / "pokemon.srm"
-        prev_save_path.parent.mkdir(parents=True, exist_ok=True)
-        prev_save_path.write_bytes(b"USER_PROGRESS_NEW")
-        # Ensure local mtime is newer than server (local_wins compares mtimes).
-        fresh = time.time()
-        os.utime(str(prev_save_path), (fresh, fresh))
-
-        # Server has an older, stale save — must NOT end up on disk.
-        plugin._fake_api.saves[100] = {
-            "id": 100,
-            "rom_id": 42,
-            "file_name": "pokemon.srm",
-            "updated_at": "2020-01-01T00:00:00Z",
-            "file_size_bytes": len(b"SERVER_STALE"),
-            "emulator": "retroarch",
-            "download_path": "/saves/pokemon.srm",
-        }
-        plugin._fake_api.uploaded_files[100] = str(tmp_path / "server_stale.srm")
-        (tmp_path / "server_stale.srm").write_bytes(b"SERVER_STALE")
-
-        result = await plugin.post_exit_sync(42)
-
-        assert result["success"] is True
-        # Local progress at PREVIOUS path was uploaded.
-        upload_calls = [c for c in plugin._fake_api.call_log if c[0] == "upload_save"]
-        assert len(upload_calls) == 1
-        uploaded_path = upload_calls[0][1][1]
-        assert uploaded_path == str(prev_save_path)
-        with open(uploaded_path, "rb") as f:
-            assert f.read() == b"USER_PROGRESS_NEW"
-
-        # PREVIOUS path still has the real user progress, byte-identical.
-        assert prev_save_path.exists()
-        assert prev_save_path.read_bytes() == b"USER_PROGRESS_NEW"
-
-        # No file landed at the NEW layout (no stale download).
-        new_save_path = tmp_path / "retrodeck" / "saves" / "pokemon.srm"
-        assert not new_save_path.exists()
 
     @pytest.mark.asyncio
     async def test_post_exit_sync_new_from_start_skips_stale_download(self, plugin, tmp_path):
@@ -799,29 +741,6 @@ class TestSyncRomSaves:
 
 
 # ============================================================================
-# Pending Conflicts (Plugin callable integration)
-# ============================================================================
-
-
-class TestPendingConflicts:
-    """Tests for conflict queue management."""
-
-    @pytest.mark.asyncio
-    async def test_resolve_invalid_resolution(self, plugin):
-        """Invalid resolution string is rejected."""
-        result = await plugin.resolve_conflict(42, "pokemon.srm", "invalid")
-
-        assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_resolve_missing_server_save_id(self, plugin):
-        """Resolving without server_save_id returns failure."""
-        result = await plugin.resolve_conflict(42, "pokemon.srm", "upload")
-
-        assert result["success"] is False
-
-
-# ============================================================================
 # Retry Logic (MRO verification)
 # ============================================================================
 
@@ -835,67 +754,6 @@ class TestRetryMRO:
         result = plugin._http_adapter.with_retry(fn, "arg1")
         assert result == "ok"
         fn.assert_called_once_with("arg1")
-
-
-# ============================================================================
-# Conflict Resolution Edge Cases (Plugin callable integration)
-# ============================================================================
-
-
-class TestResolveConflictEdgeCases:
-    """Edge cases for resolve_conflict callable — tests that work without mixin methods."""
-
-    @pytest.mark.asyncio
-    async def test_resolve_upload_without_server_save_id(self, plugin, tmp_path):
-        """Resolving upload without server_save_id returns error."""
-        _install_rom(plugin, tmp_path)
-        save_file = _create_save(tmp_path)
-
-        plugin._save_sync_state["device_id"] = "dev-1"
-
-        result = await plugin.resolve_conflict(
-            42,
-            "pokemon.srm",
-            "upload",
-            server_save_id=None,
-            local_path=str(save_file),
-        )
-
-        assert result["success"] is False
-        assert "server_save_id" in result["message"].lower()
-
-    @pytest.mark.asyncio
-    async def test_resolve_download_missing_server_save_id(self, plugin, tmp_path):
-        """Resolving download when server_save_id is missing fails gracefully."""
-        _install_rom(plugin, tmp_path)
-
-        result = await plugin.resolve_conflict(
-            42,
-            "pokemon.srm",
-            "download",
-            server_save_id=None,
-            local_path=str(tmp_path / "retrodeck" / "saves" / "gba" / "pokemon.srm"),
-        )
-
-        assert result["success"] is False
-        assert "server_save_id" in result["message"].lower()
-
-    @pytest.mark.asyncio
-    async def test_resolve_upload_local_file_deleted(self, plugin, tmp_path):
-        """Resolving upload when local file was deleted fails gracefully."""
-        _install_rom(plugin, tmp_path)
-        # Note: no save file created on disk
-
-        result = await plugin.resolve_conflict(
-            42,
-            "pokemon.srm",
-            "upload",
-            server_save_id=100,
-            local_path=str(tmp_path / "retrodeck" / "saves" / "gba" / "pokemon.srm"),
-        )
-
-        assert result["success"] is False
-        assert "not found" in result["message"].lower()
 
 
 # ============================================================================
@@ -1185,50 +1043,19 @@ class TestSavesVersionHistoryCallables:
             "download_path": "/saves/pokemon.srm",
         }
 
-        result = await plugin.saves_rollback_to_version(42, "default", "pokemon.srm", 50)
+        result = await plugin.saves_rollback_to_version(42, "default", 50)
 
         assert result["status"] == "ok"
         download_calls = [c for c in plugin._fake_api.call_log if c[0] == "download_save_content"]
         assert any(c[1][0] == 50 for c in download_calls)
 
     @pytest.mark.asyncio
-    async def test_saves_rollback_to_version_force_param(self, plugin, tmp_path):
-        """saves_rollback_to_version passes force=True to service when specified."""
-        _install_rom(plugin, tmp_path)
+    async def test_saves_rollback_to_version_signature(self, plugin):
+        """saves_rollback_to_version's signature is (rom_id, slot, save_id) —
+        no force flag (matrix pre-flight replaced Gate D/F) and no filename
+        (the canonical local path is derived from the target save + ROM)."""
+        import inspect
 
-        saves_dir = tmp_path / "retrodeck" / "saves" / "gba"
-        saves_dir.mkdir(parents=True, exist_ok=True)
-        save_file = saves_dir / "pokemon.srm"
-        save_file.write_bytes(b"\xff" * 1024)  # different from last_sync_hash
-
-        plugin._save_sync_state["saves"]["42"] = {
-            "system": "gba",
-            "active_slot": "default",
-            "files": {"pokemon.srm": {"tracked_save_id": 100, "last_sync_hash": "aabbcc"}},
-        }
-        plugin._fake_api.saves[100] = {
-            "id": 100,
-            "rom_id": 42,
-            "file_name": "pokemon.srm",
-            "updated_at": "2026-03-10T00:00:00Z",
-            "file_size_bytes": 1024,
-            "slot": "default",
-            "download_path": "/saves/pokemon.srm",
-        }
-        plugin._fake_api.saves[50] = {
-            "id": 50,
-            "rom_id": 42,
-            "file_name": "pokemon.srm",
-            "updated_at": "2026-03-01T00:00:00Z",
-            "file_size_bytes": 1024,
-            "slot": "default",
-            "download_path": "/saves/pokemon.srm",
-        }
-
-        # Without force=True, should return unsynced_changes
-        result_no_force = await plugin.saves_rollback_to_version(42, "default", "pokemon.srm", 50, False)
-        assert result_no_force["status"] == "unsynced_changes"
-
-        # With force=True, should succeed
-        result_force = await plugin.saves_rollback_to_version(42, "default", "pokemon.srm", 50, True)
-        assert result_force["status"] == "ok"
+        sig = inspect.signature(plugin.saves_rollback_to_version)
+        params = list(sig.parameters.keys())
+        assert params == ["rom_id", "slot", "save_id"]

@@ -63,7 +63,21 @@ class Plugin:
     # -- pruning ---------------------------------------------------------------
 
     def _prune_stale_installed_roms(self):
-        """Remove installed_roms entries whose files no longer exist on disk."""
+        """Remove installed_roms entries whose files no longer exist on disk.
+
+        Skipped entirely when the RetroDECK home path is not yet available on
+        disk — that almost always means the SD card hasn't finished mounting
+        (boot-time race), and a naive os.path.exists() check would wipe every
+        entry that lives on the card. The next plugin reload, with the
+        filesystem ready, will run the prune normally.
+        """
+        retrodeck_home = self._retrodeck_paths.get_retrodeck_home()
+        if not retrodeck_home or not os.path.exists(retrodeck_home):
+            decky.logger.info(
+                f"Skipping installed_roms prune: retrodeck home unavailable ({retrodeck_home or 'unset'})"
+            )
+            return
+
         pruned = []
         for rom_id, entry in list(self._state["installed_roms"].items()):  # list(): dict mutated below
             file_path = entry.get("file_path", "")
@@ -647,11 +661,8 @@ class Plugin:
     async def sync_all_saves(self):
         return await self._save_sync_service.sync_all_saves()
 
-    async def resolve_conflict(self, rom_id, filename, resolution, server_save_id=None, local_path=None):
-        return await self._save_sync_service.resolve_conflict(rom_id, filename, resolution, server_save_id, local_path)
-
-    async def resolve_newer_in_slot(self, rom_id, filename, resolution, newer_save_id):
-        return await self._save_sync_service.resolve_newer_in_slot(rom_id, filename, resolution, newer_save_id)
+    async def resolve_sync_conflict(self, rom_id, filename, action):
+        return await self._save_sync_service.resolve_sync_conflict(rom_id, filename, action)
 
     async def get_save_sync_settings(self):
         return self._save_sync_service.get_save_sync_settings()
@@ -668,8 +679,8 @@ class Plugin:
     async def saves_list_file_versions(self, rom_id, slot, filename):
         return await self._save_sync_service.list_file_versions(rom_id, slot, filename)
 
-    async def saves_rollback_to_version(self, rom_id, slot, filename, save_id, force=False):
-        return await self._save_sync_service.rollback_to_version(rom_id, slot, filename, save_id, force)
+    async def saves_rollback_to_version(self, rom_id, slot, save_id):
+        return await self._save_sync_service.rollback_to_version(rom_id, slot, save_id)
 
     async def record_session_start(self, rom_id):
         return self._playtime_service.record_session_start(rom_id)

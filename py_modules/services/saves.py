@@ -6,6 +6,7 @@ No ``import decky`` — error utilities come from ``lib.errors``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import hashlib
@@ -21,17 +22,16 @@ from typing import TYPE_CHECKING, ClassVar
 from models.saves import SaveConflict
 
 from domain.emulator_tag import build_emulator_tag, detect_core_change
-from domain.save_conflicts import (
-    build_conflict_dict,
-    check_local_changes,
-    check_server_changes_fast,
-    determine_action,
-    resolve_conflict_by_mode,
-)
 from domain.save_extensions import get_save_extensions
 from domain.save_path import resolve_save_dir
-from domain.save_sync import determine_sync_action, match_local_to_server_saves
-from lib.errors import RommApiError, RommConflictError, classify_error
+from domain.sync_action import (
+    Conflict,
+    Download,
+    Skip,
+    Upload,
+    compute_sync_action,
+)
+from lib.errors import RommApiError, classify_error
 from services.protocols import (
     CoreNameProviderFn,
     CoreResolverFn,
@@ -45,11 +45,9 @@ _DEVICE_NOT_REGISTERED = "Device not registered"
 _NO_MIGRATION = object()  # sentinel: no slot migration requested
 
 if TYPE_CHECKING:
-    import asyncio
     import logging
     from collections.abc import Callable
 
-    from domain.save_sync import MatchedSave
     from services.protocols import EventEmitter
 
 
@@ -165,6 +163,15 @@ class SaveService:
         self._plugin_version = plugin_version
         self._emit = emit
         self._detect_sort_change = detect_sort_change
+        # Per-rom lock dict — serializes concurrent sync operations on the
+        # same rom_id (pre_launch_sync, post_exit_sync, manual sync, resolve).
+        self._rom_sync_locks: dict[int, asyncio.Lock] = {}
+
+    def _rom_lock(self, rom_id: int) -> asyncio.Lock:
+        """Return the lock for this rom_id, creating it lazily."""
+        if rom_id not in self._rom_sync_locks:
+            self._rom_sync_locks[rom_id] = asyncio.Lock()
+        return self._rom_sync_locks[rom_id]
 
     # ------------------------------------------------------------------
     # Debug logging helper
@@ -205,17 +212,44 @@ class SaveService:
         }
 
     def init_state(self) -> None:
-        """Populate ``_save_sync_state`` with defaults (idempotent)."""
+        """Populate ``_save_sync_state`` with defaults (idempotent).
+
+        Defaults only — schema migrations on loaded data live in
+        ``load_state``. Running them here would be a no-op because
+        ``init_state`` is called before any disk data is loaded.
+        """
         defaults = self.make_default_state()
         for key, value in defaults.items():
             self._save_sync_state.setdefault(key, value)
         self._save_sync_state.setdefault("settings", {})
         for key, value in defaults["settings"].items():
             self._save_sync_state["settings"].setdefault(key, value)
-        # Migrate: rename "active_core" → "last_synced_core" in per-game entries
-        for _rid, entry in self._save_sync_state.get("saves", {}).items():
+
+    def _migrate_loaded_state(self) -> None:
+        """Apply schema migrations to data just read from disk.
+
+        Migrations are idempotent. Called from ``load_state`` after the
+        disk content has been merged into ``_save_sync_state``; the next
+        ``save_state`` then persists the cleaned form.
+
+        Currently:
+        - Rename per-game ``active_core`` → ``last_synced_core``.
+        - Drop legacy per-file ``dismissed_newer_save_id`` (was used by
+          the removed newer-in-slot detection).
+        """
+        saves = self._save_sync_state.get("saves", {})
+        if not isinstance(saves, dict):
+            return
+        for entry in saves.values():
+            if not isinstance(entry, dict):
+                continue
             if "active_core" in entry:
                 entry["last_synced_core"] = entry.pop("active_core")
+            files = entry.get("files", {})
+            if isinstance(files, dict):
+                for file_state in files.values():
+                    if isinstance(file_state, dict):
+                        file_state.pop("dismissed_newer_save_id", None)
 
     def load_state(self) -> None:
         """Load save sync state from disk, merging with defaults."""
@@ -232,7 +266,8 @@ class SaveService:
             if "settings" in saved:
                 self._save_sync_state["settings"].update(saved["settings"])
         except (FileNotFoundError, json.JSONDecodeError):
-            pass
+            return
+        self._migrate_loaded_state()
 
     def save_state(self) -> None:
         """Persist save sync state to disk (atomic write)."""
@@ -462,101 +497,6 @@ class SaveService:
                 with contextlib.suppress(OSError):
                     os.remove(tmp_path)
 
-    # ------------------------------------------------------------------
-    # Conflict Detection
-    # ------------------------------------------------------------------
-
-    def _check_server_changes(self, file_state: dict, server_save: dict, last_sync_hash: str) -> bool:
-        """Compare server metadata/hash against baseline to detect server modifications."""
-        fast = check_server_changes_fast(file_state, server_save)
-        if fast is not None:
-            return fast
-
-        # Slow path: timestamp changed or no stored timestamp — download and hash
-        server_updated_at = server_save.get("updated_at", "")
-        server_size = server_save.get("file_size_bytes")
-        try:
-            server_hash = self._retry.with_retry(self._get_server_save_hash, server_save)
-        except Exception:
-            server_hash = None
-        if server_hash and server_hash != last_sync_hash:
-            return True
-
-        # False alarm — update stored metadata
-        if file_state:
-            file_state["last_sync_server_updated_at"] = server_updated_at
-            if server_size is not None:
-                file_state["last_sync_server_size"] = server_size
-        return False
-
-    def _extract_device_sync_info(self, server_save: dict) -> dict | None:
-        """Extract this device's sync info from server save response.
-
-        Returns the device_syncs entry for our server_device_id, or None.
-        """
-        server_device_id = self._get_server_device_id()
-        if not server_device_id:
-            return None
-        device_syncs = server_save.get("device_syncs", [])
-        for sync in device_syncs:
-            if str(sync.get("device_id")) == server_device_id:
-                return sync
-        return None
-
-    def _detect_conflict(self, rom_id: int, filename: str, local_hash: str | None, server_save: dict) -> str:
-        """Hybrid conflict detection.
-
-        Returns: ``"skip"``, ``"download"``, ``"upload"``, or ``"conflict"``.
-        """
-        rom_id_str = str(int(rom_id))
-        save_state = self._save_sync_state["saves"].get(rom_id_str, {})
-        file_state = save_state.get("files", {}).get(filename, {})
-        last_sync_hash = file_state.get("last_sync_hash")
-
-        # Never synced before — state recovery
-        if not last_sync_hash:
-            if local_hash:
-                try:
-                    server_hash = self._retry.with_retry(self._get_server_save_hash, server_save)
-                except Exception:
-                    server_hash = None
-                if server_hash is None:
-                    return "conflict"  # Can't verify, ask user
-                return "skip" if local_hash == server_hash else "conflict"
-            return "download"
-
-        local_changed = check_local_changes(local_hash, last_sync_hash)
-
-        # v4.7: try device_syncs from server response
-        device_sync_info = self._extract_device_sync_info(server_save)
-        if device_sync_info is not None:
-            # Use v4.7 path — avoids expensive server hash download
-            result = determine_sync_action(local_changed, server_save, device_sync_info, file_state)
-            self._log_debug(
-                f"_detect_conflict({rom_id}, {filename}): v4.7 path "
-                f"local_changed={local_changed} is_current={device_sync_info.get('is_current')} → {result}"
-            )
-            return result
-
-        # Timestamp fallback: slow-path when device_syncs unavailable
-        server_changed = self._check_server_changes(file_state, server_save, last_sync_hash)
-        result = determine_action(local_changed, server_changed)
-
-        self._log_debug(
-            f"_detect_conflict({rom_id}, {filename}): timestamp fallback "
-            f"local_hash={local_hash[:8] if local_hash else None}… "
-            f"baseline={last_sync_hash[:8] if last_sync_hash else None}… "
-            f"local_changed={local_changed} server_changed={server_changed} → {result}"
-        )
-        return result
-
-    def _resolve_conflict_by_mode(self, local_mtime: float, server_save: dict) -> str:
-        """Wrapper: apply configured conflict resolution mode via domain function."""
-        settings = self._save_sync_state.get("settings", {})
-        mode = settings.get("conflict_mode", "ask_me")
-        tolerance = settings.get("clock_skew_tolerance_sec", 60)
-        return resolve_conflict_by_mode(mode, local_mtime, server_save, tolerance)
-
     def _update_file_sync_state(
         self,
         rom_id_str: str,
@@ -705,64 +645,6 @@ class SaveService:
         rom_state["own_upload_ids"] = own_ids
         self.save_state()
 
-    def _sync_single_save_file(
-        self,
-        rom_id: int,
-        filename: str,
-        local: dict | None,
-        server: dict | None,
-    ) -> tuple[str, str]:
-        """Determine and resolve the sync action for one save file.
-
-        Returns ``(action, local_hash)`` where action is the *resolved*
-        action after conflict-mode processing (may be ``"ask"``).
-        """
-        local_hash = ""
-        if local and server:
-            local_hash = self._file_md5(local["path"])
-            action = self._detect_conflict(rom_id, filename, local_hash, server)
-        elif local:
-            action = "upload"
-        elif server:
-            action = "download"
-        else:
-            return "none", local_hash
-
-        if action == "skip":
-            return "skip", local_hash
-
-        if action == "conflict":
-            assert server is not None
-            local_mtime = os.path.getmtime(local["path"]) if local else 0
-            resolution = self._resolve_conflict_by_mode(local_mtime, server)
-            if resolution == "ask":
-                return "ask", local_hash
-            action = resolution
-
-        return action, local_hash
-
-    def _handle_conflict_error(
-        self,
-        rom_id: int,
-        filename: str,
-        local: dict | None,
-        server: dict | None,
-        local_hash: str,
-        errors: list[str],
-        conflicts: list[SaveConflict | dict],
-    ) -> None:
-        """Handle a RommConflictError by recording a conflict or error entry."""
-        if local and server:
-            local_path = local["path"]
-            local_info = {
-                "path": local_path,
-                "mtime": os.path.getmtime(local_path) if os.path.isfile(local_path) else None,
-                "size": os.path.getsize(local_path) if os.path.isfile(local_path) else None,
-            }
-            conflicts.append(build_conflict_dict(rom_id, filename, local_info, local_hash, server))
-        else:
-            errors.append(f"{filename}: conflict without matching local+server")
-
     def _handle_unexpected_error(
         self,
         e: Exception,
@@ -777,31 +659,169 @@ class SaveService:
         with contextlib.suppress(OSError):
             os.remove(tmp)
 
-    def _execute_sync_action(
+    @staticmethod
+    def _filter_server_saves_to_slot(server_saves: list[dict], active_slot: str | None) -> list[dict]:
+        """Filter server saves to the active slot.
+
+        Saves with ``slot=None`` (legacy/no-slot) are accepted under any active
+        slot; in legacy mode (no active slot) we only keep saves without a slot.
+        """
+        if active_slot:
+            return [ss for ss in server_saves if ss.get("slot") == active_slot or ss.get("slot") is None]
+        return [ss for ss in server_saves if not ss.get("slot")]
+
+    @staticmethod
+    def _build_local_input(local_path: str, filename: str) -> dict:
+        """Build the dict shape consumed by ``compute_sync_action``."""
+        return {
+            "filename": filename,
+            "path": local_path,
+            "size": os.path.getsize(local_path) if os.path.isfile(local_path) else None,
+            "mtime": os.path.getmtime(local_path) if os.path.isfile(local_path) else None,
+        }
+
+    @staticmethod
+    def _local_save_target(server_save: dict, rom_name: str) -> str:
+        """The canonical local filename for a server save: ``<rom_name>.<ext>``.
+
+        ``rom_name`` is the deterministic identity from RetroArch's
+        perspective — it's the ROM file's basename without extension, the
+        same string RetroArch uses to look up SRAM. Callers must have
+        already resolved the ROM via ``_get_rom_save_info`` (which only
+        returns when the ROM is actually installed); there is no fallback
+        to server-derived names because those can mismatch RetroArch's
+        actual lookup path and silently break the sync.
+        """
+        ext = server_save.get("file_extension", "srm")
+        return f"{rom_name}.{ext}"
+
+    def _build_sync_conflict_entry(
         self,
-        action: str,
+        rom_id: int,
+        filename: str,
+        server: dict,
+        local_path: str | None,
+        local_hash: str | None,
+    ) -> dict:
+        """Build a Phase-2 ``sync_conflict`` descriptor for the frontend."""
+        local_mtime = None
+        local_size = None
+        if local_path and os.path.isfile(local_path):
+            local_mtime = datetime.fromtimestamp(os.path.getmtime(local_path), tz=UTC).isoformat()
+            local_size = os.path.getsize(local_path)
+        return {
+            "type": "sync_conflict",
+            "rom_id": rom_id,
+            "filename": filename,
+            "server_save_id": server.get("id"),
+            "server_updated_at": server.get("updated_at", ""),
+            "server_size": server.get("file_size_bytes"),
+            "local_path": local_path,
+            "local_hash": local_hash,
+            "local_mtime": local_mtime,
+            "local_size": local_size,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+
+    def _dispatch_skip(
+        self,
+        action: Skip,
+        *,
         rom_id: int,
         rom_id_str: str,
         filename: str,
-        local: dict | None,
-        server: dict | None,
-        local_hash: str,
+        local_hash: str | None,
+    ) -> None:
+        if action.adopt_baseline and local_hash is not None:
+            # State-only mutation: write the current local_hash as the baseline
+            # so future runs can detect drift. No I/O, no synced count.
+            self._log_debug(f"_sync_rom_saves({rom_id}): skip + adopt_baseline {filename} ({action.reason})")
+            self._adopt_baseline_hash(rom_id_str, filename, local_hash)
+        else:
+            self._log_debug(f"_sync_rom_saves({rom_id}): skip {filename} ({action.reason})")
+
+    def _dispatch_upload(
+        self,
+        action: Upload,
+        *,
+        rom_id: int,
+        rom_id_str: str,
+        filename: str,
+        local_path: str | None,
+        system: str,
+        server_saves: list[dict],
+        errors: list[str],
+    ) -> bool:
+        """Execute an ``Upload`` action. Returns True iff the upload was issued."""
+        if local_path is None:
+            errors.append(f"{filename}: upload requested but no local file")
+            return False
+        if action.target_save_id is None:
+            # POST path: brand-new save in slot.
+            self._do_upload_save(rom_id, local_path, filename, rom_id_str, system, None)
+            return True
+        # PUT path: re-upload to update the tracked save (local diverged while
+        # is_current=true).
+        server_save = next((s for s in server_saves if s.get("id") == action.target_save_id), None)
+        if server_save is None:
+            # Picked save vanished between read and dispatch — best-effort.
+            self._log_debug(
+                f"_dispatch_sync_action: target_save_id={action.target_save_id} not in server_saves; skipping",
+            )
+            return False
+        self._do_upload_save(rom_id, local_path, filename, rom_id_str, system, server_save)
+        return True
+
+    def _dispatch_sync_action(
+        self,
+        action: object,
+        *,
+        rom_id: int,
+        rom_id_str: str,
+        filename: str,
+        local_path: str | None,
+        local_hash: str | None,
         saves_dir: str,
         system: str,
+        server_saves: list[dict],
         errors: list[str],
         conflicts: list[SaveConflict | dict],
     ) -> bool:
-        """Execute a resolved sync action (download/upload). Returns True if synced."""
+        """Execute one ``SyncAction`` outcome. Returns True if a transfer happened.
+
+        Centralises the I/O dispatch so ``_sync_rom_saves`` stays declarative.
+        Errors are caught and pushed onto ``errors`` so a single failure can't
+        abort the whole rom-level sync.
+        """
         try:
-            if action == "download":
-                assert server is not None
-                self._do_download_save(server, saves_dir, filename, rom_id_str, system)
+            if isinstance(action, Skip):
+                self._dispatch_skip(
+                    action,
+                    rom_id=rom_id,
+                    rom_id_str=rom_id_str,
+                    filename=filename,
+                    local_hash=local_hash,
+                )
+                return False
+            if isinstance(action, Upload):
+                return self._dispatch_upload(
+                    action,
+                    rom_id=rom_id,
+                    rom_id_str=rom_id_str,
+                    filename=filename,
+                    local_path=local_path,
+                    system=system,
+                    server_saves=server_saves,
+                    errors=errors,
+                )
+            if isinstance(action, Download):
+                self._do_download_save(action.server_save, saves_dir, filename, rom_id_str, system)
                 return True
-            if action == "upload" and local:
-                self._do_upload_save(rom_id, local["path"], filename, rom_id_str, system, server)
-                return True
-        except RommConflictError:
-            self._handle_conflict_error(rom_id, filename, local, server, local_hash, errors, conflicts)
+            if isinstance(action, Conflict):
+                conflicts.append(
+                    self._build_sync_conflict_entry(rom_id, filename, action.server_save, local_path, local_hash)
+                )
+                return False
         except RommApiError as e:
             _code, _msg = classify_error(e)
             errors.append(f"{filename}: {_msg}")
@@ -809,135 +829,140 @@ class SaveService:
             self._handle_unexpected_error(e, filename, saves_dir, errors)
         return False
 
-    def _process_single_file_sync(
+    def _adopt_baseline_hash(self, rom_id_str: str, filename: str, local_hash: str) -> None:
+        """Persist ``local_hash`` as the file's ``last_sync_hash`` baseline.
+
+        Used by Skip(adopt_baseline=True) — the algorithm has detected that
+        we've observed an is_current=true situation with local content but no
+        baseline yet. Recording the baseline lets subsequent runs detect
+        offline-edit drift. State mutation only, no I/O.
+        """
+        saves = self._save_sync_state.setdefault("saves", {})
+        rom_entry = saves.setdefault(rom_id_str, {"files": {}})
+        files = rom_entry.setdefault("files", {})
+        file_state = files.setdefault(filename, {})
+        file_state["last_sync_hash"] = local_hash
+
+    def _sync_local_files(
         self,
+        local_files: list[dict],
+        *,
         rom_id: int,
         rom_id_str: str,
-        filename: str,
-        local: dict | None,
-        server: dict | None,
-        saves_dir: str,
+        device_id: str,
+        server_in_slot: list[dict],
+        files_state: dict,
         system: str,
+        saves_dir: str,
         errors: list[str],
         conflicts: list[SaveConflict | dict],
-    ) -> bool:
-        """Process sync for one save file. Returns True if a file was synced."""
-        t_file = time.time()
-        action, local_hash = self._sync_single_save_file(rom_id, filename, local, server)
+    ) -> tuple[int, set[str]]:
+        """Run ``compute_sync_action`` on every local file and dispatch each outcome.
 
-        self._log_debug(
-            f"[TIMING] _sync_rom_saves({rom_id}): detect {filename} -> {action} {time.time() - t_file:.3f}s"
-        )
-
-        if action in ("skip", "none"):
-            return False
-
-        if action == "ask":
-            if local and server:
-                local_path = local["path"]
-                local_info = {
-                    "path": local_path,
-                    "mtime": os.path.getmtime(local_path) if os.path.isfile(local_path) else None,
-                    "size": os.path.getsize(local_path) if os.path.isfile(local_path) else None,
-                }
-                conflicts.append(build_conflict_dict(rom_id, filename, local_info, local_hash, server))
-            return False
-
-        t_action = time.time()
-        result = self._execute_sync_action(
-            action,
-            rom_id,
-            rom_id_str,
-            filename,
-            local,
-            server,
-            local_hash,
-            saves_dir,
-            system,
-            errors,
-            conflicts,
-        )
-        self._log_debug(f"[TIMING] _sync_rom_saves({rom_id}): {action} {filename} {time.time() - t_action:.3f}s")
-        return result
-
-    def _check_newer_in_slot(
-        self,
-        m: MatchedSave,
-        files_state: dict,
-        rom_id: int,
-        save_state: dict,
-        conflicts: list[SaveConflict | dict],
-    ) -> bool:
-        """Check if a matched save has a newer version in its slot from another device.
-
-        Returns True if the normal sync step should be skipped (conflict appended).
+        Returns ``(synced_count, handled_filenames)``. ``handled_filenames`` is
+        used by the server-only sweep to skip targets already addressed.
         """
-        if not m.newer_save_in_slot:
-            return False
-        file_state = files_state.get(m.filename, {})
-        dismissed_id = file_state.get("dismissed_newer_save_id")
-        newer_id = m.newer_save_in_slot.get("id")
-        if dismissed_id is None or (newer_id is not None and newer_id > dismissed_id):
-            conflicts.append(
-                self._build_newer_in_slot_conflict(
-                    rom_id,
-                    m.filename,
-                    m.server_save,
-                    m.newer_save_in_slot,
-                    save_state.get("active_slot"),
-                )
+        synced = 0
+        handled_filenames: set[str] = set()
+        for lf in local_files:
+            filename = lf["filename"]
+            local_path = lf["path"]
+            local_hash = self._file_md5(local_path) if os.path.isfile(local_path) else None
+            file_state = files_state.get(filename, {})
+            action = compute_sync_action(
+                local_file=self._build_local_input(local_path, filename),
+                server_saves_in_slot=server_in_slot,
+                files_state=file_state,
+                device_id=device_id,
+                local_hash=local_hash,
             )
-            return True
-        return False
+            handled_filenames.add(filename)
+            self._log_debug(f"_sync_rom_saves({rom_id}): local {filename} -> {type(action).__name__}")
+            if self._dispatch_sync_action(
+                action,
+                rom_id=rom_id,
+                rom_id_str=rom_id_str,
+                filename=filename,
+                local_path=local_path,
+                local_hash=local_hash,
+                saves_dir=saves_dir,
+                system=system,
+                server_saves=server_in_slot,
+                errors=errors,
+                conflicts=conflicts,
+            ):
+                synced += 1
+        return synced, handled_filenames
 
-    @staticmethod
-    def _build_newer_in_slot_conflict(
+    def _sync_server_only_saves(
+        self,
+        server_in_slot: list[dict],
+        *,
         rom_id: int,
-        filename: str,
-        tracked_save: dict | None,
-        newer_save: dict,
-        slot: str | None,
-    ) -> dict:
-        """Build a newer-in-slot conflict descriptor for the frontend."""
-        return {
-            "type": "newer_in_slot",
-            "rom_id": rom_id,
-            "filename": filename,
-            "tracked_save_id": tracked_save.get("id") if tracked_save else None,
-            "tracked_updated_at": tracked_save.get("updated_at") if tracked_save else None,
-            "newer_save_id": newer_save.get("id"),
-            "newer_updated_at": newer_save.get("updated_at"),
-            "slot": slot,
-        }
+        rom_id_str: str,
+        rom_name: str,
+        device_id: str,
+        files_state: dict,
+        handled_filenames: set[str],
+        pending_migration: bool,
+        system: str,
+        saves_dir: str,
+        errors: list[str],
+        conflicts: list[SaveConflict | dict],
+    ) -> int:
+        """Address server saves whose canonical local target wasn't already
+        handled by the local-file sweep. Returns the number of transfers.
 
-    @staticmethod
-    def _should_skip_server_only_during_migration(m, pending_migration: bool) -> bool:
-        """Return True if this match is a server-only download that must be skipped during pending migration.
-
-        During a pending save-sort migration we run in upload-only mode so that
-        no freshly-downloaded file lands on disk with ``mtime=now`` — otherwise
-        the mtime-naive migration resolver could prefer the stale download over
-        the real user progress at the other layout (#238).
+        Skipped entirely while a save-sort migration is pending (see #238).
         """
-        return pending_migration and m.local_file is None and m.server_save is not None
+        # Group server saves by canonical local target filename. compute_sync_action
+        # picks newest-in-group automatically.
+        server_only_groups: dict[str, list[dict]] = {}
+        for ss in server_in_slot:
+            target = self._local_save_target(ss, rom_name)
+            if target in handled_filenames:
+                continue
+            server_only_groups.setdefault(target, []).append(ss)
 
-    def _log_match_debug(self, m, rom_id: int) -> None:
-        """Emit a debug line describing how a single match will be handled.
-
-        Extracted from ``_sync_rom_saves`` so the per-match log-line ternaries
-        don't inflate the parent's cognitive complexity (Sonar S3776).
-        """
-        method_label = f" [{m.match_method}]" if m.match_method not in ("filename", "local_only") else ""
-        local_label = "yes" if m.local_file else "no"
-        server_label = m.server_save.get("id") if m.server_save else "none"
-        self._log_debug(
-            f"_sync_rom_saves({rom_id}): {m.filename}{method_label} local={local_label} server={server_label}"
-        )
+        synced = 0
+        for target_filename, group in server_only_groups.items():
+            if pending_migration:
+                self._log_debug(
+                    f"_sync_rom_saves({rom_id}): skipping server_only {target_filename} — migration pending"
+                )
+                continue
+            file_state = files_state.get(target_filename, {})
+            action = compute_sync_action(
+                local_file=None,
+                server_saves_in_slot=group,
+                files_state=file_state,
+                device_id=device_id,
+                local_hash=None,
+            )
+            self._log_debug(f"_sync_rom_saves({rom_id}): server-only {target_filename} -> {type(action).__name__}")
+            if self._dispatch_sync_action(
+                action,
+                rom_id=rom_id,
+                rom_id_str=rom_id_str,
+                filename=target_filename,
+                local_path=None,
+                local_hash=None,
+                saves_dir=saves_dir,
+                system=system,
+                server_saves=group,
+                errors=errors,
+                conflicts=conflicts,
+            ):
+                synced += 1
+        return synced
 
     def _sync_rom_saves(self, rom_id: int) -> tuple[int, list[str], list[SaveConflict | dict]]:
-        """Sync saves for a single ROM (always bidirectional).
+        """Sync saves for a single ROM.
 
-        Returns ``(synced_count, errors_list, conflicts_list)``.
+        Runs ``compute_sync_action`` for every local file and every
+        server-only save in the active slot via two focused helpers,
+        dispatching each outcome through ``_dispatch_sync_action``. Returns
+        ``(synced_count, errors_list, conflicts_list)``.
         """
         t_total = time.time()
         rom_id = int(rom_id)
@@ -951,7 +976,6 @@ class SaveService:
         rom_name = info["rom_name"]
         saves_dir = info["saves_dir"]
 
-        # Fetch server saves (with retry)
         t0 = time.time()
         try:
             device_id = self._get_server_device_id()
@@ -973,51 +997,40 @@ class SaveService:
 
         save_state = self._save_sync_state["saves"].get(rom_id_str, {})
         files_state = save_state.get("files", {})
+        active_slot = save_state.get("active_slot")
+        server_in_slot = self._filter_server_saves_to_slot(server_saves, active_slot)
 
-        # Match local files to server saves (domain logic)
-        match_result = match_local_to_server_saves(
-            local_files,
-            server_saves,
-            files_state,
-            save_state.get("active_slot"),
-            rom_name,
-            device_id=device_id,
-        )
-
-        # Persist any new tracked_save_ids discovered by fallback matching
-        for fn, save_id in match_result.new_tracked_ids.items():
-            files_state.setdefault(fn, {})["tracked_save_id"] = save_id
-            self._log_debug(f"Fallback match: {fn} -> server save id={save_id}")
-
-        synced = 0
         errors: list[str] = []
         conflicts: list[SaveConflict | dict] = []
+        device_id_str = device_id or ""
 
-        # During a pending save-sort migration the local layout is ambiguous —
-        # the session that just ended may have written to the previous layout,
-        # while the new layout may hold stale or no content. Downloading the
-        # server copy in that window would land a file with mtime=now at the
-        # new layout, which the mtime-naive migration resolver would then
-        # prefer over the real user progress at the previous layout (#238).
-        # Upload-only mode during pending migration keeps sync as a safety net
-        # without risking data loss. Downloads resume once the user resolves
-        # the migration.
-        pending_migration = self._is_save_sort_changed()
-
-        for m in match_result.matched:
-            if self._should_skip_server_only_during_migration(m, pending_migration):
-                self._log_debug(f"_sync_rom_saves({rom_id}): skipping server_only {m.filename} — migration pending")
-                continue
-
-            # Check for newer-in-slot before normal sync
-            if self._check_newer_in_slot(m, files_state, rom_id, save_state, conflicts):
-                continue  # Skip normal sync
-
-            self._log_match_debug(m, rom_id)
-            if self._process_single_file_sync(
-                rom_id, rom_id_str, m.filename, m.local_file, m.server_save, saves_dir, system, errors, conflicts
-            ):
-                synced += 1
+        synced_local, handled_filenames = self._sync_local_files(
+            local_files,
+            rom_id=rom_id,
+            rom_id_str=rom_id_str,
+            device_id=device_id_str,
+            server_in_slot=server_in_slot,
+            files_state=files_state,
+            system=system,
+            saves_dir=saves_dir,
+            errors=errors,
+            conflicts=conflicts,
+        )
+        synced_server = self._sync_server_only_saves(
+            server_in_slot,
+            rom_id=rom_id,
+            rom_id_str=rom_id_str,
+            rom_name=rom_name,
+            device_id=device_id_str,
+            files_state=files_state,
+            handled_filenames=handled_filenames,
+            pending_migration=self._is_save_sort_changed(),
+            system=system,
+            saves_dir=saves_dir,
+            errors=errors,
+            conflicts=conflicts,
+        )
+        synced = synced_local + synced_server
 
         # Record when this sync check ran (regardless of whether files transferred)
         save_entry = self._save_sync_state["saves"].setdefault(rom_id_str, {})
@@ -1086,103 +1099,195 @@ class SaveService:
             "uploaded_by_us": uploaded_by_us,
         }
 
+    @staticmethod
+    def _status_from_action(action: object) -> str:
+        """Map a ``SyncAction`` outcome to the legacy file-status string."""
+        if isinstance(action, Skip):
+            return "synced"
+        if isinstance(action, Upload):
+            return "upload"
+        if isinstance(action, Download):
+            return "download"
+        if isinstance(action, Conflict):
+            return "conflict"
+        return "synced"
+
+    @staticmethod
+    def _resolve_chosen_server(action: object, candidates: list[dict]) -> dict | None:
+        """Pick the server-save dict to display alongside the file-status row.
+
+        - ``Download`` and ``Conflict`` carry the chosen save explicitly on the
+          action — use that.
+        - ``Skip`` falls back to the newest in *candidates* so the status panel
+          still shows a server reference where one exists (e.g. synced rows
+          continue to display the server save's metadata).
+        - ``Upload(target_save_id=None)`` (POST-as-new) has no server reference
+          yet → ``None``.
+        - ``Upload(target_save_id=int)`` (PUT) targets an existing save in
+          *candidates* — fall back to the newest so the status panel still
+          shows the server-side metadata while the upload is pending.
+        """
+        if isinstance(action, Download | Conflict):
+            return action.server_save
+        if isinstance(action, Upload) and action.target_save_id is None:
+            return None
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.get("updated_at", ""))
+
+    def _status_entry_for_local_file(
+        self,
+        local_file: dict,
+        *,
+        rom_id: int,
+        rom_id_str: str,
+        server_in_slot: list[dict],
+        files_state: dict,
+        server_device_id: str | None,
+        own_upload_ids: list[int] | None,
+    ) -> tuple[dict, dict | None]:
+        """Build the file-status entry for an existing local file.
+
+        Returns ``(status_entry, conflict_entry_or_None)``. The conflict
+        entry is the ``sync_conflict`` descriptor when ``compute_sync_action``
+        returns ``Conflict``; otherwise None.
+        """
+        filename = local_file["filename"]
+        local_path = local_file["path"]
+        local_hash = self._file_md5(local_path) if os.path.isfile(local_path) else None
+        file_state = files_state.get(filename, {})
+        action = compute_sync_action(
+            local_file=self._build_local_input(local_path, filename),
+            server_saves_in_slot=server_in_slot,
+            files_state=file_state,
+            device_id=server_device_id or "",
+            local_hash=local_hash,
+        )
+        if isinstance(action, Skip) and action.adopt_baseline and local_hash is not None:
+            self._adopt_baseline_hash(rom_id_str, filename, local_hash)
+        chosen_server = self._resolve_chosen_server(action, server_in_slot)
+        local_mtime = (
+            datetime.fromtimestamp(os.path.getmtime(local_path), tz=UTC).isoformat()
+            if os.path.isfile(local_path)
+            else None
+        )
+        local_size = os.path.getsize(local_path) if os.path.isfile(local_path) else None
+        status_entry = self._build_file_status(
+            filename,
+            local_path=local_path,
+            local_hash=local_hash,
+            local_mtime=local_mtime,
+            local_size=local_size,
+            server=chosen_server,
+            last_sync_at=file_state.get("last_sync_at"),
+            status=self._status_from_action(action),
+            server_device_id=server_device_id,
+            uploaded_by_us=_compute_uploaded_by_us(chosen_server, own_upload_ids),
+        )
+        conflict_entry: dict | None = None
+        if isinstance(action, Conflict):
+            self._log_debug(
+                f"_get_save_status_io({rom_id}): conflict {filename} server_save_id={action.server_save.get('id')}"
+            )
+            conflict_entry = self._build_sync_conflict_entry(
+                rom_id, filename, action.server_save, local_path, local_hash
+            )
+        return status_entry, conflict_entry
+
+    def _status_entry_for_server_only(
+        self,
+        server_in_slot: list[dict],
+        *,
+        rom_name: str,
+        server_device_id: str | None,
+        own_upload_ids: list[int] | None,
+    ) -> dict:
+        """Build the ready-to-download status entry when no local file exists
+        but the slot has server saves. Picks newest by ``updated_at``."""
+        newest = max(server_in_slot, key=lambda s: s.get("updated_at", ""))
+        return self._build_file_status(
+            self._local_save_target(newest, rom_name),
+            local_path=None,
+            local_hash=None,
+            local_mtime=None,
+            local_size=None,
+            server=newest,
+            last_sync_at=None,
+            status="download",
+            server_device_id=server_device_id,
+            uploaded_by_us=_compute_uploaded_by_us(newest, own_upload_ids),
+        )
+
     def _get_save_status_io(self, rom_id: int, server_saves: list[dict]) -> dict:
         """Sync helper for get_save_status — runs in executor.
 
-        Performs local file checks, MD5 hashing, and conflict detection.
+        Builds the saves-tab status for one ROM as a single-entry view of
+        the active slot:
+
+        - Local file present: run ``compute_sync_action`` and surface the
+          resulting status, server attribution, and any conflict.
+        - No local file but the slot has server saves: surface the newest
+          server save as "ready to download". The canonical local target
+          is ``<rom_name>.<server.file_extension>`` — derived purely from
+          RetroArch's view of the ROM.
+        - ROM not installed (no rom_name available) → no entry. There is
+          no server-derived filename fallback: without a deterministic
+          local path we cannot tell the user where a download would land.
+        - Empty slot → no entry.
+
+        Older versions of the same slot are reachable via the lazy-fetched
+        ``Previous Versions`` dropdown (``list_file_versions``).
+
+        The one allowed mutation is recording an adopted baseline hash when
+        the action requests it (``Skip(adopt_baseline=True)``) — pure state
+        hygiene, no network traffic.
         """
         rom_id_str = str(rom_id)
-        local_files = self._find_save_files(rom_id)
         info = self._get_rom_save_info(rom_id)
-        rom_name = info["rom_name"] if info else None
         server_device_id = self._get_server_device_id()
 
         save_state = self._save_sync_state["saves"].get(rom_id_str, {})
         files_state = save_state.get("files", {})
+        active_slot = save_state.get("active_slot")
+        server_in_slot = self._filter_server_saves_to_slot(server_saves, active_slot)
 
         # own_upload_ids: None means missing key (legacy entry — unknown attribution).
         raw_own_ids = save_state.get("own_upload_ids")
         own_upload_ids: list[int] | None = raw_own_ids if isinstance(raw_own_ids, list) else None
 
-        # Match local files to server saves (same domain logic as _sync_rom_saves).
-        # device_id is required so _find_newer_in_slot can distinguish foreign
-        # saves from our own.
-        match_result = match_local_to_server_saves(
-            local_files,
-            server_saves,
-            files_state,
-            save_state.get("active_slot"),
-            rom_name,
-            device_id=server_device_id,
-        )
+        file_statuses: list[dict] = []
+        conflicts: list[SaveConflict | dict] = []
 
-        file_statuses = []
-        newer_in_slot_conflicts: list[SaveConflict | dict] = []
-        for m in match_result.matched:
-            if m.local_file:
-                local_hash = self._file_md5(m.local_file["path"])
-                server = m.server_save
-                if server:
-                    action = self._detect_conflict(rom_id, m.filename, local_hash, server)
-                elif local_hash:
-                    action = "upload"
-                else:
-                    action = "skip"
+        if info is not None:
+            rom_name = info["rom_name"]
+            local_files = self._find_save_files(rom_id)
+            local_file = local_files[0] if local_files else None
+
+            if local_file is not None:
+                status_entry, conflict_entry = self._status_entry_for_local_file(
+                    local_file,
+                    rom_id=rom_id,
+                    rom_id_str=rom_id_str,
+                    server_in_slot=server_in_slot,
+                    files_state=files_state,
+                    server_device_id=server_device_id,
+                    own_upload_ids=own_upload_ids,
+                )
+                file_statuses.append(status_entry)
+                if conflict_entry is not None:
+                    conflicts.append(conflict_entry)
+            elif server_in_slot:
                 file_statuses.append(
-                    self._build_file_status(
-                        m.filename,
-                        local_path=m.local_file["path"],
-                        local_hash=local_hash,
-                        local_mtime=datetime.fromtimestamp(os.path.getmtime(m.local_file["path"]), tz=UTC).isoformat(),
-                        local_size=os.path.getsize(m.local_file["path"]),
-                        server=server,
-                        last_sync_at=files_state.get(m.filename, {}).get("last_sync_at"),
-                        status=action,
+                    self._status_entry_for_server_only(
+                        server_in_slot,
+                        rom_name=rom_name,
                         server_device_id=server_device_id,
-                        uploaded_by_us=_compute_uploaded_by_us(server, own_upload_ids),
+                        own_upload_ids=own_upload_ids,
                     )
                 )
-            elif m.server_save:
-                # Server-only
-                file_statuses.append(
-                    self._build_file_status(
-                        m.filename,
-                        local_path=None,
-                        local_hash=None,
-                        local_mtime=None,
-                        local_size=None,
-                        server=m.server_save,
-                        last_sync_at=None,
-                        status="download",
-                        server_device_id=server_device_id,
-                        uploaded_by_us=_compute_uploaded_by_us(m.server_save, own_upload_ids),
-                    )
-                )
-            # Surface newer-in-slot warnings (another device uploaded a newer
-            # save) alongside the status. Mirrors _sync_rom_saves behaviour
-            # so the banner appears on tab open, not only after a full sync.
-            self._check_newer_in_slot(m, files_state, rom_id, save_state, newer_in_slot_conflicts)
 
         playtime = self._save_sync_state.get("playtime", {}).get(rom_id_str, {})
         save_entry = self._save_sync_state.get("saves", {}).get(rom_id_str, {})
-
-        conflicts: list[SaveConflict | dict] = [
-            {
-                "rom_id": rom_id,
-                "filename": fs["filename"],
-                "local_path": fs["local_path"],
-                "local_hash": fs.get("local_hash"),
-                "local_mtime": fs.get("local_mtime"),
-                "local_size": fs.get("local_size"),
-                "server_save_id": fs.get("server_save_id") or 0,
-                "server_updated_at": fs.get("server_updated_at") or "",
-                "server_size": fs.get("server_size"),
-                "created_at": datetime.now(UTC).isoformat(),
-            }
-            for fs in file_statuses
-            if fs["status"] == "conflict"
-        ]
-        conflicts.extend(newer_in_slot_conflicts)
 
         return {
             "rom_id": rom_id,
@@ -1193,35 +1298,6 @@ class SaveService:
             "conflicts": conflicts,
             "save_sort_changed": self._is_save_sort_changed(),
         }
-
-    def _resolve_conflict_io(
-        self,
-        rom_id: int,
-        rom_id_str: str,
-        resolution: str,
-        conflict: dict,
-        saves_dir: str,
-        filename: str,
-        system: str,
-    ) -> dict | None:
-        """Sync helper for resolve_conflict — performs blocking I/O in executor."""
-        if resolution == "download":
-            server_save_id = conflict.get("server_save_id")
-            if not server_save_id:
-                return {"success": False, "message": "No server save ID"}
-            server_save = self._retry.with_retry(lambda: self._romm_api.get_save_metadata(server_save_id))
-            self._do_download_save(server_save, saves_dir, filename, rom_id_str, system)
-        else:  # upload
-            local_path = conflict.get("local_path")
-            if not local_path or not os.path.isfile(local_path):
-                return {"success": False, "message": "Local file not found"}
-            server_save = None
-            if conflict.get("server_save_id"):
-                with contextlib.suppress(Exception):
-                    ssid = conflict["server_save_id"]
-                    server_save = self._retry.with_retry(lambda: self._romm_api.get_save_metadata(ssid))
-            self._do_upload_save(rom_id, local_path, filename, rom_id_str, system, server_save)
-        return None  # Success — caller handles state update
 
     # ------------------------------------------------------------------
     # Public async API (callable endpoints)
@@ -1399,125 +1475,131 @@ class SaveService:
 
     async def pre_launch_sync(self, rom_id: int) -> dict:
         """Download newer saves from server before game launch."""
-        if not self._is_save_sync_enabled():
-            return {"success": True, "message": "Save sync disabled", "synced": 0}
+        rom_id = int(rom_id)
+        async with self._rom_lock(rom_id):
+            if not self._is_save_sync_enabled():
+                return {"success": True, "message": "Save sync disabled", "synced": 0}
 
-        # Refresh save-sort state before the migration gate — see #238.
-        await self._refresh_save_sort_state("pre_launch_sync")
+            # Refresh save-sort state before the migration gate — see #238.
+            await self._refresh_save_sort_state("pre_launch_sync")
 
-        if self._is_save_sort_changed():
+            if self._is_save_sort_changed():
+                return {
+                    "success": False,
+                    "message": "RetroArch save sorting changed — migrate saves in Settings first",
+                    "synced": 0,
+                    "save_sort_changed": True,
+                }
+
+            settings = self._save_sync_state.get("settings", {})
+            if not settings.get("sync_before_launch", True):
+                return {"success": True, "message": "Pre-launch sync disabled", "synced": 0}
+
+            if not self._save_sync_state.get("device_id"):
+                reg = await self.ensure_device_registered()
+                if not reg.get("success"):
+                    return {"success": False, "message": _DEVICE_NOT_REGISTERED}
+
+            synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
+            self.save_state()
+
+            msg = f"Downloaded {synced} save(s)"
+            if errors:
+                msg += f", {len(errors)} error(s)"
             return {
-                "success": False,
-                "message": "RetroArch save sorting changed — migrate saves in Settings first",
-                "synced": 0,
-                "save_sort_changed": True,
+                "success": len(errors) == 0,
+                "message": msg,
+                "synced": synced,
+                "errors": errors,
+                "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
             }
-
-        settings = self._save_sync_state.get("settings", {})
-        if not settings.get("sync_before_launch", True):
-            return {"success": True, "message": "Pre-launch sync disabled", "synced": 0}
-
-        if not self._save_sync_state.get("device_id"):
-            reg = await self.ensure_device_registered()
-            if not reg.get("success"):
-                return {"success": False, "message": _DEVICE_NOT_REGISTERED}
-
-        synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
-        self.save_state()
-
-        msg = f"Downloaded {synced} save(s)"
-        if errors:
-            msg += f", {len(errors)} error(s)"
-        return {
-            "success": len(errors) == 0,
-            "message": msg,
-            "synced": synced,
-            "errors": errors,
-            "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
-        }
 
     async def post_exit_sync(self, rom_id: int) -> dict:
         """Upload changed saves after game exit."""
         self._logger.info("post_exit_sync called for rom_id=%d", rom_id)
+        rom_id = int(rom_id)
 
-        if not self._is_save_sync_enabled():
-            self._logger.info("post_exit_sync skipped: save sync disabled")
-            return {"success": True, "message": "Save sync disabled", "synced": 0}
+        async with self._rom_lock(rom_id):
+            if not self._is_save_sync_enabled():
+                self._logger.info("post_exit_sync skipped: save sync disabled")
+                return {"success": True, "message": "Save sync disabled", "synced": 0}
 
-        settings = self._save_sync_state.get("settings", {})
-        if not settings.get("sync_after_exit", True):
-            self._logger.info("post_exit_sync skipped: sync_after_exit disabled")
-            return {"success": True, "message": "Post-exit sync disabled", "synced": 0}
+            settings = self._save_sync_state.get("settings", {})
+            if not settings.get("sync_after_exit", True):
+                self._logger.info("post_exit_sync skipped: sync_after_exit disabled")
+                return {"success": True, "message": "Post-exit sync disabled", "synced": 0}
 
-        # Refresh save-sort state before _sync_rom_saves reads saves_dir — see #238.
-        await self._refresh_save_sort_state("post_exit_sync")
+            # Refresh save-sort state before _sync_rom_saves reads saves_dir — see #238.
+            await self._refresh_save_sort_state("post_exit_sync")
 
-        try:
-            await self._loop.run_in_executor(None, self._romm_api.heartbeat)
-        except Exception:
-            self._logger.info("post_exit_sync skipped: server offline")
-            return {"success": False, "message": "Server offline", "synced": 0, "offline": True}
+            try:
+                await self._loop.run_in_executor(None, self._romm_api.heartbeat)
+            except Exception:
+                self._logger.info("post_exit_sync skipped: server offline")
+                return {"success": False, "message": "Server offline", "synced": 0, "offline": True}
 
-        if not self._save_sync_state.get("device_id"):
-            reg = await self.ensure_device_registered()
-            if not reg.get("success"):
-                return {"success": False, "message": _DEVICE_NOT_REGISTERED}
+            if not self._save_sync_state.get("device_id"):
+                reg = await self.ensure_device_registered()
+                if not reg.get("success"):
+                    return {"success": False, "message": _DEVICE_NOT_REGISTERED}
 
-        synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
-        self.save_state()
+            synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
+            self.save_state()
 
-        self._logger.info(
-            "post_exit_sync complete for rom_id=%d: synced=%d, errors=%d, conflicts=%d",
-            rom_id,
-            synced,
-            len(errors),
-            len(conflicts),
-        )
+            self._logger.info(
+                "post_exit_sync complete for rom_id=%d: synced=%d, errors=%d, conflicts=%d",
+                rom_id,
+                synced,
+                len(errors),
+                len(conflicts),
+            )
 
-        msg = f"Uploaded {synced} save(s)"
-        if errors:
-            msg += f", {len(errors)} error(s)"
-        if conflicts:
-            msg += f", {len(conflicts)} conflict(s)"
-        return {
-            "success": len(errors) == 0,
-            "message": msg,
-            "synced": synced,
-            "errors": errors,
-            "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
-        }
+            msg = f"Uploaded {synced} save(s)"
+            if errors:
+                msg += f", {len(errors)} error(s)"
+            if conflicts:
+                msg += f", {len(conflicts)} conflict(s)"
+            return {
+                "success": len(errors) == 0,
+                "message": msg,
+                "synced": synced,
+                "errors": errors,
+                "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
+            }
 
     async def sync_rom_saves(self, rom_id: int) -> dict:
         """Bidirectional sync for a single ROM (manual trigger from game detail)."""
-        if not self._is_save_sync_enabled():
-            return {"success": False, "message": _SYNC_DISABLED_MSG, "synced": 0}
+        rom_id = int(rom_id)
+        async with self._rom_lock(rom_id):
+            if not self._is_save_sync_enabled():
+                return {"success": False, "message": _SYNC_DISABLED_MSG, "synced": 0}
 
-        # Refresh save-sort state before _sync_rom_saves reads saves_dir — see #238.
-        # Manual sync paths must observe fresh sort state too: a user could
-        # edit retroarch.cfg outside of a session and then trigger a manual
-        # sync before any detect has fired.
-        await self._refresh_save_sort_state("sync_rom_saves")
+            # Refresh save-sort state before _sync_rom_saves reads saves_dir — see #238.
+            # Manual sync paths must observe fresh sort state too: a user could
+            # edit retroarch.cfg outside of a session and then trigger a manual
+            # sync before any detect has fired.
+            await self._refresh_save_sort_state("sync_rom_saves")
 
-        if not self._save_sync_state.get("device_id"):
-            reg = await self.ensure_device_registered()
-            if not reg.get("success"):
-                return {"success": False, "message": _DEVICE_NOT_REGISTERED}
+            if not self._save_sync_state.get("device_id"):
+                reg = await self.ensure_device_registered()
+                if not reg.get("success"):
+                    return {"success": False, "message": _DEVICE_NOT_REGISTERED}
 
-        synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, int(rom_id))
-        self.save_state()
+            synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
+            self.save_state()
 
-        msg = f"Synced {synced} save(s)"
-        if errors:
-            msg += f", {len(errors)} error(s)"
-        if conflicts:
-            msg += f", {len(conflicts)} conflict(s)"
-        return {
-            "success": len(errors) == 0,
-            "message": msg,
-            "synced": synced,
-            "errors": errors,
-            "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
-        }
+            msg = f"Synced {synced} save(s)"
+            if errors:
+                msg += f", {len(errors)} error(s)"
+            if conflicts:
+                msg += f", {len(conflicts)} conflict(s)"
+            return {
+                "success": len(errors) == 0,
+                "message": msg,
+                "synced": synced,
+                "errors": errors,
+                "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
+            }
 
     async def get_save_slots(self, rom_id: int) -> dict:
         """List available save slots for a ROM.
@@ -1762,7 +1844,8 @@ class SaveService:
 
         # 7. Sync local state to match the new slot
         if slot_saves:
-            # New slot has server saves — download them, replacing local files
+            # New slot has server saves — download them, replacing local files.
+            # rom_name is guaranteed by the earlier ``info`` check (line 1642).
             await self._loop.run_in_executor(
                 None,
                 self._do_switch_downloads,
@@ -1770,6 +1853,7 @@ class SaveService:
                 saves_dir,
                 rom_id_str,
                 system,
+                info["rom_name"],
             )
         else:
             # New slot is empty — delete local save files for a fresh start
@@ -1795,16 +1879,17 @@ class SaveService:
         saves_dir: str,
         rom_id_str: str,
         system: str,
+        rom_name: str,
     ) -> None:
         """Download all saves from *slot_saves* into *saves_dir*.
 
-        Runs synchronously — call via ``run_in_executor``.
+        Each save lands at ``<saves_dir>/<rom_name>.<server.file_extension>`` —
+        the canonical RetroArch path. Runs synchronously; call via
+        ``run_in_executor``.
         """
         for server_save in slot_saves:
-            filename = server_save.get("file_name", "")
-            if not filename:
-                continue
-            self._do_download_save(server_save, saves_dir, filename, rom_id_str, system)
+            target = self._local_save_target(server_save, rom_name)
+            self._do_download_save(server_save, saves_dir, target, rom_id_str, system)
 
     def _delete_local_saves_for_switch(self, rom_id: int, rom_id_str: str) -> None:
         """Delete local save files and clear file tracking state for a slot switch.
@@ -2057,7 +2142,9 @@ class SaveService:
 
         for rom_id_str in sorted(rom_ids):
             rom_count += 1
-            synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, int(rom_id_str))
+            rom_id_int = int(rom_id_str)
+            async with self._rom_lock(rom_id_int):
+                synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id_int)
             total_synced += synced
             total_errors.extend(errors)
             all_conflicts.extend(conflicts)
@@ -2080,146 +2167,191 @@ class SaveService:
             "errors": total_errors,
         }
 
-    async def resolve_conflict(
+    async def resolve_sync_conflict(
         self,
         rom_id: int,
         filename: str,
-        resolution: str,
-        server_save_id: int | None = None,
-        local_path: str | None = None,
+        action: str,
     ) -> dict:
-        """Resolve a pending save conflict. resolution: ``"upload"`` or ``"download"``."""
-        rom_id = int(rom_id)
-        rom_id_str = str(rom_id)
+        """Resolve a pending sync conflict (true two-sided divergence).
 
-        if resolution not in ("upload", "download"):
-            return {"success": False, "message": f"Invalid resolution: {resolution}"}
+        Reached when ``compute_sync_action`` returned ``Conflict`` — the
+        server moved AND local diverged from baseline, so the user picked a
+        side via the conflict UI.
 
-        # Build conflict from params passed by frontend
-        if not server_save_id:
-            return {"success": False, "message": "Missing server_save_id"}
-        conflict = {
-            "rom_id": rom_id,
-            "filename": filename,
-            "server_save_id": server_save_id,
-            "local_path": local_path,
-        }
+        ``action`` is one of:
 
-        info = self._get_rom_save_info(rom_id)
-        if not info:
-            return {"success": False, "message": "ROM not installed"}
-        system = info["system"]
-        saves_dir = info["saves_dir"]
-
-        try:
-            result = await self._loop.run_in_executor(
-                None,
-                self._resolve_conflict_io,
-                rom_id,
-                rom_id_str,
-                resolution,
-                conflict,
-                saves_dir,
-                filename,
-                system,
-            )
-            if result is not None:
-                return result
-
-            self.save_state()
-            return {"success": True, "message": f"Conflict resolved: {resolution}"}
-        except Exception as e:
-            self._logger.error(f"Conflict resolution failed: {e}")
-            return {"success": False, "message": "Conflict resolution failed"}
-
-    async def resolve_newer_in_slot(self, rom_id: int, filename: str, resolution: str, newer_save_id: int) -> dict:
-        """Resolve a newer-in-slot conflict.
-
-        resolution: ``"use_newer"`` | ``"keep_current"`` | ``"dismiss"``
+        - ``"keep_local"`` — push local to the current server save (PUT). When
+          the local content already matches the server's content hash we adopt
+          it silently without re-uploading.
+        - ``"use_server"`` — download the current server save, replacing local.
         """
         rom_id = int(rom_id)
         rom_id_str = str(rom_id)
 
-        if resolution == "use_newer":
+        if action not in ("keep_local", "use_server"):
+            return {"success": False, "message": f"Invalid action: {action}"}
+
+        async with self._rom_lock(rom_id):
             info = self._get_rom_save_info(rom_id)
             if not info:
-                return {"success": False, "message": "ROM save info not found"}
-            device_id = self._get_server_device_id()
-            server_saves = await self._loop.run_in_executor(
-                None,
-                lambda: self._retry.with_retry(lambda: self._romm_api.list_saves(rom_id, device_id=device_id)),
-            )
-            newer_save = next((s for s in server_saves if s.get("id") == newer_save_id), None)
-            if not newer_save:
-                return {"success": False, "message": "Newer save not found on server"}
-            await self._loop.run_in_executor(
-                None,
-                self._do_download_save,
-                newer_save,
-                info["saves_dir"],
-                filename,
-                rom_id_str,
-                info["system"],
-            )
-            # Re-fetch live reference — _do_download_save replaced the dict
-            live_state = self._save_sync_state["saves"].get(rom_id_str, {}).get("files", {}).get(filename, {})
-            live_state.pop("dismissed_newer_save_id", None)
-            self.save_state()
-            return {"success": True, "message": "Downloaded newer save"}
+                return {"success": False, "message": "ROM not installed"}
+            system = info["system"]
+            saves_dir = info["saves_dir"]
 
-        if resolution == "dismiss":
-            files = self._save_sync_state.get("saves", {}).get(rom_id_str, {}).setdefault("files", {})
-            live_state = files.setdefault(filename, {})
-            live_state["dismissed_newer_save_id"] = newer_save_id
-            self.save_state()
-            return {"success": True, "message": "Dismissed"}
+            try:
+                device_id = self._get_server_device_id()
+                server_saves = await self._loop.run_in_executor(
+                    None,
+                    lambda: self._retry.with_retry(
+                        lambda: self._romm_api.list_saves(rom_id, device_id=device_id),
+                    ),
+                )
+            except Exception as e:
+                _code, _msg = classify_error(e)
+                return {"success": False, "message": f"Failed to fetch saves: {_msg}"}
 
-        # keep_current
-        return {"success": True, "message": "Keeping current save"}
+            save_state = self._save_sync_state["saves"].get(rom_id_str, {})
+            active_slot = save_state.get("active_slot")
+            server_in_slot = self._filter_server_saves_to_slot(server_saves, active_slot)
+            if not server_in_slot:
+                return {"success": False, "message": "No server save in active slot"}
+            server = max(server_in_slot, key=lambda s: s.get("updated_at", ""))
+
+            try:
+                if action == "use_server":
+                    await self._loop.run_in_executor(
+                        None,
+                        self._apply_resolve_use_server,
+                        rom_id_str,
+                        server,
+                        saves_dir,
+                        system,
+                        info["rom_name"],
+                    )
+                    self._logger.info(
+                        "resolve_sync_conflict(rom_id=%d, filename=%s, action=%s) -> success",
+                        rom_id,
+                        filename,
+                        action,
+                    )
+                    return {"success": True, "action": "use_server"}
+
+                # keep_local
+                await self._loop.run_in_executor(
+                    None,
+                    self._apply_resolve_keep_local,
+                    rom_id,
+                    rom_id_str,
+                    filename,
+                    server,
+                    saves_dir,
+                    system,
+                )
+                self._logger.info(
+                    "resolve_sync_conflict(rom_id=%d, filename=%s, action=%s) -> success",
+                    rom_id,
+                    filename,
+                    action,
+                )
+                return {"success": True, "action": "keep_local"}
+            except Exception as e:
+                self._logger.error(f"resolve_sync_conflict({rom_id}, {filename}, {action}) failed: {e}")
+                return {"success": False, "message": str(e)}
+
+    def _apply_resolve_use_server(
+        self,
+        rom_id_str: str,
+        server: dict,
+        saves_dir: str,
+        system: str,
+        rom_name: str,
+    ) -> None:
+        """Download *server* into the canonical local save file and update state.
+
+        The write path is always ``<rom_name>.<server.file_extension>`` — the
+        path RetroArch reads. Drives state-key consistency too:
+        ``_update_file_sync_state`` receives the same target name the file
+        lands at.
+        """
+        target = self._local_save_target(server, rom_name)
+        self._do_download_save(server, saves_dir, target, rom_id_str, system)
+        self.save_state()
+
+    def _apply_resolve_keep_local(
+        self,
+        rom_id: int,
+        rom_id_str: str,
+        filename: str,
+        server: dict,
+        saves_dir: str,
+        system: str,
+    ) -> None:
+        """Push the local file to *server* (PUT). Adopt-without-upload when the
+        local content already matches the server's content hash.
+        """
+        local_path = os.path.join(saves_dir, filename)
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"Local save not found: {local_path}")
+        local_hash = self._file_md5(local_path)
+        try:
+            server_hash = self._retry.with_retry(self._get_server_save_hash, server)
+        except Exception:
+            server_hash = None
+
+        if server_hash and local_hash == server_hash:
+            # Hashes match — adopt server's id without re-uploading.
+            self._log_debug(
+                f"keep_local: hash matches server, adopting without upload (rom={rom_id} filename={filename})"
+            )
+            saves = self._save_sync_state.setdefault("saves", {})
+            rom_entry = saves.setdefault(rom_id_str, {"files": {}})
+            files = rom_entry.setdefault("files", {})
+            file_state = files.setdefault(filename, {})
+            file_state["tracked_save_id"] = server.get("id")
+            file_state["last_sync_hash"] = local_hash
+            file_state["last_sync_at"] = datetime.now(UTC).isoformat()
+            file_state["last_sync_server_updated_at"] = server.get("updated_at", "")
+            file_state["last_sync_server_size"] = server.get("file_size_bytes")
+            file_state["last_sync_local_mtime"] = os.path.getmtime(local_path)
+            file_state["last_sync_local_size"] = os.path.getsize(local_path)
+            self.save_state()
+            return
+
+        # Upload local content as a PUT against the existing server save.
+        self._do_upload_save(rom_id, local_path, filename, rom_id_str, system, server)
+        self.save_state()
 
     # ------------------------------------------------------------------
     # Version History API
     # ------------------------------------------------------------------
 
-    def _find_file_state(self, rom_id_str: str, filename: str, server_saves: list[dict]) -> dict:
-        """Look up the per-file sync state for *filename*.
+    def _find_file_state(self, rom_id_str: str, filename: str, server_saves: list[dict]) -> dict:  # noqa: ARG002 — server_saves kept for callable signature stability
+        """Look up the per-file sync state for *filename* (canonical local name).
 
-        Tries an exact key match first.  If that misses (e.g. because the state
-        key includes RomM timestamp tags while *filename* is the plain local
-        name), falls back to scanning entries whose ``tracked_save_id`` resolves
-        to a server save with the same ``file_name_no_tags``.
+        State keys are always ``<rom_name>.<ext>`` — the same canonical
+        local filename produced by ``_local_save_target`` and consumed by
+        RetroArch — so a single dict lookup is enough. The previous
+        ``file_name_no_tags``-anchored slow path is gone.
         """
         files_state = self._save_sync_state.get("saves", {}).get(rom_id_str, {}).get("files", {})
-
-        # Fast path: exact key match
-        exact = files_state.get(filename)
-        if exact and exact.get("tracked_save_id") is not None:
-            return exact
-
-        # Slow path: derive base name from filename, scan for matching entry
-        fn_base = filename.rsplit(".", 1)[0] if "." in filename else filename
-        for _key, entry in files_state.items():
-            tid = entry.get("tracked_save_id")
-            if tid is None:
-                continue
-            srv = next((s for s in server_saves if s.get("id") == tid), None)
-            if srv is None:
-                continue
-            srv_base = srv.get("file_name_no_tags") or ""
-            # file_name_no_tags strips region tags too (e.g. "(USA)"),
-            # so check if the local base starts with it
-            if srv_base and fn_base.startswith(srv_base):
-                return entry
-
-        return {}
+        return files_state.get(filename, {})
 
     async def list_file_versions(self, rom_id: int, slot: str, filename: str) -> list[dict]:
-        """List older server-side versions of a save file.
+        """List server-side saves in the active slot, excluding the currently-tracked one.
 
-        Returns versions strictly older than the currently-tracked save,
-        sorted newest-first.
+        The slot is the unit, not the filename. Saves uploaded by other
+        clients (RomM web UI, third-party clients, etc.) whose naming
+        convention differs from ours are first-class versions of the same
+        slot, so no filename filter is applied — every save in the slot
+        except the one we're currently tracking shows up here.
 
-        Each entry contains: id, updated_at, file_size_bytes, device_syncs.
+        Sorted by ``updated_at`` descending (newest first). Each entry
+        contains: id, file_name, emulator, updated_at, file_size_bytes,
+        device_syncs, uploaded_by_us.
+
+        ``filename`` is kept in the signature for compatibility with the
+        callable wiring but no longer affects which versions are returned.
         """
         rom_id = int(rom_id)
         rom_id_str = str(rom_id)
@@ -2235,25 +2367,13 @@ class SaveService:
         except Exception:
             return []
 
-        # Find the tracked save and its base name (file_name_no_tags)
         file_state = self._find_file_state(rom_id_str, filename, server_saves)
         tracked_id = file_state.get("tracked_save_id")
 
-        # Resolve the base name from the tracked save on the server.
-        # Consistent with domain/save_sync.py server-only grouping which also
-        # uses file_name_no_tags to group saves that belong together.
-        tracked_save = next((s for s in server_saves if s.get("id") == tracked_id), None)
-        if tracked_save is None:
-            # Can't determine base name without a tracked save — no versions to show.
-            return []
-        base_name = tracked_save.get("file_name_no_tags") or tracked_save.get("file_name", "")
-
-        # Resolve own_upload_ids for attribution — None means legacy state (unknown).
         rom_state = self._save_sync_state["saves"].get(rom_id_str, {})
         raw = rom_state.get("own_upload_ids")
         own_upload_ids: list[int] | None = raw if isinstance(raw, list) else None
 
-        # Filter to saves with the same base name, excluding the tracked one
         versions = [
             {
                 "id": s["id"],
@@ -2265,25 +2385,46 @@ class SaveService:
                 "uploaded_by_us": (s["id"] in own_upload_ids) if own_upload_ids is not None else None,
             }
             for s in server_saves
-            if (s.get("file_name_no_tags") or s.get("file_name", "")) == base_name and s.get("id") != tracked_id
+            if s.get("id") != tracked_id
         ]
 
-        # Sort by updated_at descending (client-side — do not trust server order)
         versions.sort(key=lambda v: v["updated_at"], reverse=True)
         return versions
 
     def _rollback_to_version_io(
         self,
         rom_id_str: str,
-        filename: str,
         save_id: int,
-        force: bool,
         info: dict,
         server_saves: list[dict],
     ) -> dict:
-        """Blocking I/O portion of rollback_to_version — runs in executor."""
-        # Find target save in server list (match by ID only — the target may
-        # have a different file_name due to RomM timestamp tagging)
+        """Blocking I/O portion of the version-switch flow — runs in executor.
+
+        The caller is responsible for the matrix pre-flight: by the time
+        this function runs, the currently-tracked save is already in sync
+        with the server (or the switch was aborted before we got here).
+        This function is purely the destructive switch:
+
+        1. Download id=save_id content → overwrite local file.
+           ``_do_download_save`` updates ``tracked_save_id`` /
+           ``last_sync_hash`` to point at the target version locally.
+        2. PUT id=save_id with the same content. RomM v4.8.1 fires the
+           SQLAlchemy ``onupdate=utc_now`` hook, so ``save.updated_at``
+           becomes NOW and id=save_id is now newest in the slot — beating
+           anything else there.
+        3. ``_do_upload_save`` calls ``confirm_download(save_id, device_id)``,
+           setting our ``last_synced_at = save.updated_at`` so
+           ``is_current`` evaluates true for us. Required because v4.8.1
+           PUT does NOT auto-upsert sync rows.
+        4. ``_do_upload_save`` refreshes local sync state via
+           ``_update_file_sync_state`` to match the post-PUT response.
+
+        After this, the next ``compute_sync_action`` run picks id=save_id
+        (now newest), our ``is_current=true``, hash matches →
+        ``Skip(synced)``. Other devices on their next sync see id=save_id
+        as newest with their ``is_current=false`` → ``Download`` → adopt
+        our switch. Cross-device propagation works.
+        """
         target_save = next(
             (s for s in server_saves if s.get("id") == save_id),
             None,
@@ -2292,86 +2433,125 @@ class SaveService:
             return {"status": "not_found"}
 
         saves_dir = info["saves_dir"]
-        local_path = os.path.join(saves_dir, filename)
         system = info["system"]
+        rom_name = info["rom_name"]
+        target_filename = self._local_save_target(target_save, rom_name)
+        local_path = os.path.join(saves_dir, target_filename)
 
-        # Gate D: check for unsynced local changes
-        file_state = self._find_file_state(rom_id_str, filename, server_saves)
-        last_sync_hash = file_state.get("last_sync_hash")
+        self._do_download_save(target_save, saves_dir, target_filename, rom_id_str, system)
 
-        if not force and last_sync_hash and os.path.isfile(local_path):
-            current_hash = self._file_md5(local_path)
-            if current_hash != last_sync_hash:
-                return {
-                    "status": "unsynced_changes",
-                    "local_hash": current_hash,
-                    "tracked_hash": last_sync_hash,
-                }
+        try:
+            self._do_upload_save(
+                rom_id=int(rom_id_str),
+                file_path=local_path,
+                filename=target_filename,
+                rom_id_str=rom_id_str,
+                system=system,
+                server_save=target_save,
+            )
+        except Exception as e:
+            # Download already mutated local state to reflect ``save_id``, so
+            # the switch is locally complete — but cross-device propagation
+            # failed because ``updated_at`` was not bumped. Surface this so
+            # the caller can prompt the user to retry.
+            self._logger.error(
+                "_rollback_to_version_io: PUT to bump updated_at failed for rom=%s save=%s: %s",
+                rom_id_str,
+                save_id,
+                e,
+            )
+            return {"status": "put_failed", "error": str(e)}
 
-        # Download the target version to replace local file
-        self._do_download_save(target_save, saves_dir, filename, rom_id_str, system)
         return {"status": "ok"}
 
-    async def rollback_to_version(
-        self, rom_id: int, slot: str, filename: str, save_id: int, force: bool = False
-    ) -> dict:
-        """Roll back a save file to a specific older server version.
+    async def rollback_to_version(self, rom_id: int, slot: str, save_id: int) -> dict:
+        """Switch the local + tracked save to a chosen older server version.
+
+        Flow:
+
+        1. Run ``_sync_rom_saves`` as a matrix pre-flight on the
+           currently-tracked save. The matrix decides:
+
+           - ``Skip(synced)`` / ``Skip(adopt_baseline=True)`` — proceed.
+           - ``Upload(POST/PUT)`` — silently push local up, then proceed.
+           - ``Download(server)`` — silently adopt the server-newest, then
+             proceed (the user's chosen target is still in the slot).
+           - ``Conflict`` — abort with ``conflict_blocked``; user must
+             resolve via the standard ``SyncConflictModal`` first.
+
+        2. After a clean pre-flight, the destructive switch runs in
+           ``_rollback_to_version_io``: download chosen → write to
+           canonical local target → PUT same content → ``confirm_download``.
+
+        ``filename`` is kept in the signature for callable-wiring stability
+        but no longer drives any decision — the canonical local path is
+        derived from the target save and the ROM name.
 
         Returns a status dict:
         - ``{"status": "ok"}`` on success.
-        - ``{"status": "not_found"}`` if the target save id is not on the server.
-        - ``{"status": "unsynced_changes", "local_hash": ..., "tracked_hash": ...}``
-          if local file has changed since last sync and ``force`` is False.
-        - ``{"status": "tracked_missing"}`` if the currently-tracked save no
-          longer exists on the server and ``force`` is False.
+        - ``{"status": "not_found"}`` if the ROM is not installed or the
+          chosen save id is no longer on the server.
+        - ``{"status": "conflict_blocked", "conflicts": [...]}`` if the
+          pre-flight surfaced a conflict on the currently-tracked save.
+          The frontend resolves it via the standard conflict modal.
+        - ``{"status": "preflight_failed", "errors": [...]}`` if the
+          pre-flight hit non-conflict errors (network, server, etc.).
+          No switch was attempted.
+        - ``{"status": "put_failed", "error": ...}`` if the local download
+          succeeded but the server-side ``updated_at`` bump failed. Local
+          file and state already point at the target; retrying is safe
+          and idempotent. Without a successful re-PUT the switch will not
+          propagate cross-device.
         """
         rom_id = int(rom_id)
         rom_id_str = str(rom_id)
         save_id = int(save_id)
 
-        info = self._get_rom_save_info(rom_id)
-        if not info:
-            return {"status": "not_found"}
+        async with self._rom_lock(rom_id):
+            info = self._get_rom_save_info(rom_id)
+            if not info:
+                return {"status": "not_found"}
 
-        device_id = self._get_server_device_id()
+            # Matrix pre-flight: get the tracked save in sync first, or surface
+            # a conflict that the user must resolve before any switch can run.
+            _synced, errors, conflicts = await self._loop.run_in_executor(None, self._sync_rom_saves, rom_id)
+            if conflicts:
+                self.save_state()
+                return {
+                    "status": "conflict_blocked",
+                    "conflicts": [c if isinstance(c, dict) else asdict(c) for c in conflicts],
+                }
+            if errors:
+                self.save_state()
+                return {"status": "preflight_failed", "errors": errors}
 
-        # Fetch fresh server saves
-        try:
-            server_saves: list[dict] = await self._loop.run_in_executor(
+            # Re-fetch server saves after the pre-flight: it may have created
+            # or modified saves the switch needs to see.
+            device_id = self._get_server_device_id()
+            try:
+                server_saves: list[dict] = await self._loop.run_in_executor(
+                    None,
+                    lambda: self._retry.with_retry(
+                        lambda: self._romm_api.list_saves(rom_id, device_id=device_id, slot=slot if slot else None)
+                    ),
+                )
+            except Exception as e:
+                self._log_debug(f"rollback_to_version: failed to list saves: {e}")
+                return {"status": "not_found"}
+
+            result = await self._loop.run_in_executor(
                 None,
-                lambda: self._retry.with_retry(
-                    lambda: self._romm_api.list_saves(rom_id, device_id=device_id, slot=slot if slot else None)
-                ),
+                self._rollback_to_version_io,
+                rom_id_str,
+                save_id,
+                info,
+                server_saves,
             )
-        except Exception as e:
-            self._log_debug(f"rollback_to_version: failed to list saves: {e}")
-            return {"status": "not_found"}
 
-        # Gate F: verify the currently-tracked save still exists on the server.
-        # Protects against accidental rollbacks after an unrelated deletion —
-        # bypassable via ``force`` once the user has acknowledged the warning.
-        file_state = self._find_file_state(rom_id_str, filename, server_saves)
-        tracked_id = file_state.get("tracked_save_id")
-        if not force and tracked_id is not None:
-            tracked_save = next((s for s in server_saves if s.get("id") == tracked_id), None)
-            if tracked_save is None:
-                return {"status": "tracked_missing"}
+            if result.get("status") in ("ok", "put_failed"):
+                self.save_state()
 
-        result = await self._loop.run_in_executor(
-            None,
-            self._rollback_to_version_io,
-            rom_id_str,
-            filename,
-            save_id,
-            force,
-            info,
-            server_saves,
-        )
-
-        if result.get("status") == "ok":
-            self.save_state()
-
-        return result
+            return result
 
     def get_save_sync_settings(self) -> dict:
         """Return current save sync settings."""
