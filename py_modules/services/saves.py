@@ -205,10 +205,8 @@ class SaveService:
             "playtime": {},
             "settings": {
                 "save_sync_enabled": False,
-                "conflict_mode": "ask_me",
                 "sync_before_launch": True,
                 "sync_after_exit": True,
-                "clock_skew_tolerance_sec": 60,
                 "default_slot": "default",
                 "autocleanup_limit": 10,
             },
@@ -239,8 +237,15 @@ class SaveService:
         - Rename per-game ``active_core`` → ``last_synced_core``.
         - Drop legacy per-file ``dismissed_newer_save_id`` (was used by
           the removed newer-in-slot detection).
+        - Strip removed legacy settings keys (``conflict_mode``,
+          ``clock_skew_tolerance_sec``).
         """
-        saves = self._save_sync_state.get("saves", {})
+        self._migrate_saves_entries()
+        self._strip_legacy_settings()
+
+    def _migrate_saves_entries(self) -> None:
+        """Rename ``active_core`` → ``last_synced_core`` and drop dead per-file flags."""
+        saves = self._save_sync_state.get("saves")
         if not isinstance(saves, dict):
             return
         for entry in saves.values():
@@ -248,11 +253,23 @@ class SaveService:
                 continue
             if "active_core" in entry:
                 entry["last_synced_core"] = entry.pop("active_core")
-            files = entry.get("files", {})
-            if isinstance(files, dict):
-                for file_state in files.values():
-                    if isinstance(file_state, dict):
-                        file_state.pop("dismissed_newer_save_id", None)
+            files = entry.get("files")
+            if not isinstance(files, dict):
+                continue
+            for file_state in files.values():
+                if isinstance(file_state, dict):
+                    file_state.pop("dismissed_newer_save_id", None)
+
+    def _strip_legacy_settings(self) -> None:
+        """Strip removed settings keys from loaded state.
+
+        Old state files keep these forever otherwise (``load_state`` does
+        ``dict.update`` on settings, so orphan keys survive). Idempotent.
+        """
+        settings = self._save_sync_state.get("settings")
+        if isinstance(settings, dict):
+            settings.pop("conflict_mode", None)
+            settings.pop("clock_skew_tolerance_sec", None)
 
     def load_state(self) -> None:
         """Load save sync state from disk, merging with defaults."""
@@ -2590,23 +2607,17 @@ class SaveService:
         settings.setdefault("autocleanup_limit", 10)
         if not self._save_sync_state.get("settings"):
             settings.setdefault("save_sync_enabled", False)
-            settings.setdefault("conflict_mode", "ask_me")
             settings.setdefault("sync_before_launch", True)
             settings.setdefault("sync_after_exit", True)
-            settings.setdefault("clock_skew_tolerance_sec", 60)
         return settings
 
     @staticmethod
-    def _sanitize_setting(key: str, value: object, valid_modes: set[str]) -> tuple[object, bool]:
+    def _sanitize_setting(key: str, value: object) -> tuple[object, bool]:
         """Validate and coerce a single settings key/value pair.
 
         Returns (coerced_value, skip) where skip=True means the value should
-        be discarded (e.g. invalid conflict_mode or empty slot name).
+        be discarded (e.g. empty slot name).
         """
-        if key == "conflict_mode":
-            return value, value not in valid_modes
-        if key == "clock_skew_tolerance_sec":
-            return max(0, int(value)), False  # type: ignore[arg-type]
         if key == "default_slot":
             if value is None:
                 return None, False  # None = legacy mode
@@ -2619,24 +2630,21 @@ class SaveService:
         return value, False
 
     def update_save_sync_settings(self, settings: dict) -> dict:
-        """Update save sync settings (conflict_mode, sync toggles, etc.)."""
+        """Update save sync settings (sync toggles, slot, etc.)."""
         allowed_keys = {
             "save_sync_enabled",
-            "conflict_mode",
             "sync_before_launch",
             "sync_after_exit",
-            "clock_skew_tolerance_sec",
             "default_slot",
             "autocleanup_limit",
         }
-        valid_modes = {"newest_wins", "always_upload", "always_download", "ask_me"}
 
         current = self._save_sync_state.setdefault("settings", {})
 
         for key, value in settings.items():
             if key not in allowed_keys:
                 continue
-            value, skip = self._sanitize_setting(key, value, valid_modes)
+            value, skip = self._sanitize_setting(key, value)
             if skip:
                 continue
             current[key] = value

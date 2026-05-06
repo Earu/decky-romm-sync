@@ -128,7 +128,7 @@ class TestStateManagement:
 
     def test_init_state_populates_defaults(self, tmp_path):
         svc, _ = make_service(tmp_path, save_sync_state={})
-        assert svc._save_sync_state["settings"]["conflict_mode"] == "ask_me"
+        assert svc._save_sync_state["settings"]["save_sync_enabled"] is False
         assert svc._save_sync_state["saves"] == {}
 
     def test_init_state_preserves_existing(self, tmp_path):
@@ -236,6 +236,50 @@ class TestStateManagement:
 
         files = svc._save_sync_state["saves"]["42"]["files"]
         assert "dismissed_newer_save_id" not in files["good.srm"]
+
+    def test_migrate_loaded_state_strips_legacy_settings_keys(self, tmp_path):
+        """Legacy ``conflict_mode`` and ``clock_skew_tolerance_sec`` settings
+        are dropped on state load. Other settings keys survive."""
+        svc, _ = make_service(tmp_path)
+        svc._save_sync_state["settings"] = {
+            "conflict_mode": "ask_me",
+            "clock_skew_tolerance_sec": 60,
+            "save_sync_enabled": True,
+        }
+
+        svc._migrate_loaded_state()
+
+        settings = svc._save_sync_state["settings"]
+        assert "conflict_mode" not in settings
+        assert "clock_skew_tolerance_sec" not in settings
+        assert settings["save_sync_enabled"] is True
+
+    def test_migrate_loaded_state_strip_legacy_settings_idempotent(self, tmp_path):
+        """Stripping legacy settings is a no-op when they aren't present."""
+        svc, _ = make_service(tmp_path)
+        svc._save_sync_state["settings"] = {"save_sync_enabled": True}
+
+        svc._migrate_loaded_state()  # should not raise
+
+        assert svc._save_sync_state["settings"] == {"save_sync_enabled": True}
+
+    def test_migrate_loaded_state_handles_missing_settings(self, tmp_path):
+        """Migration is defensive: missing ``settings`` key doesn't crash."""
+        svc, _ = make_service(tmp_path)
+        svc._save_sync_state.pop("settings", None)
+
+        svc._migrate_loaded_state()  # should not raise
+
+        assert "settings" not in svc._save_sync_state
+
+    def test_migrate_loaded_state_handles_non_dict_settings(self, tmp_path):
+        """Migration is defensive: non-dict ``settings`` is left untouched."""
+        svc, _ = make_service(tmp_path)
+        svc._save_sync_state["settings"] = "broken"
+
+        svc._migrate_loaded_state()  # should not raise
+
+        assert svc._save_sync_state["settings"] == "broken"
 
     def test_save_and_load_state(self, tmp_path):
         svc, _ = make_service(tmp_path)
@@ -1239,8 +1283,9 @@ class TestSettings:
     async def test_get_defaults(self, tmp_path):
         svc, _ = make_service(tmp_path)
         settings = svc.get_save_sync_settings()
-        assert settings["conflict_mode"] == "ask_me"
         assert settings["save_sync_enabled"] is False
+        assert settings["sync_before_launch"] is True
+        assert settings["sync_after_exit"] is True
 
     @pytest.mark.asyncio
     async def test_update_settings(self, tmp_path):
@@ -1248,19 +1293,12 @@ class TestSettings:
         result = svc.update_save_sync_settings(
             {
                 "save_sync_enabled": True,
-                "conflict_mode": "newest_wins",
+                "sync_before_launch": False,
             }
         )
         assert result["success"] is True
         assert result["settings"]["save_sync_enabled"] is True
-        assert result["settings"]["conflict_mode"] == "newest_wins"
-
-    @pytest.mark.asyncio
-    async def test_invalid_mode_ignored(self, tmp_path):
-        svc, _ = make_service(tmp_path)
-        svc.update_save_sync_settings({"conflict_mode": "invalid_mode"})
-        settings = svc.get_save_sync_settings()
-        assert settings["conflict_mode"] == "ask_me"
+        assert result["settings"]["sync_before_launch"] is False
 
     @pytest.mark.asyncio
     async def test_unknown_key_ignored(self, tmp_path):
@@ -1268,13 +1306,6 @@ class TestSettings:
         result = svc.update_save_sync_settings({"unknown_key": "value"})
         assert result["success"] is True
         assert "unknown_key" not in result["settings"]
-
-    @pytest.mark.asyncio
-    async def test_clock_skew_clamped(self, tmp_path):
-        svc, _ = make_service(tmp_path)
-        svc.update_save_sync_settings({"clock_skew_tolerance_sec": -10})
-        settings = svc.get_save_sync_settings()
-        assert settings["clock_skew_tolerance_sec"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2294,25 +2325,25 @@ class TestSaveSyncSettingsSlotAndCleanup:
 
     def test_empty_string_becomes_none(self, tmp_path):
         svc, _ = make_service(tmp_path)
-        val, skip = svc._sanitize_setting("default_slot", "", set())
+        val, skip = svc._sanitize_setting("default_slot", "")
         assert val is None
         assert skip is False
 
     def test_none_value_passes_through(self, tmp_path):
         svc, _ = make_service(tmp_path)
-        val, skip = svc._sanitize_setting("default_slot", None, set())
+        val, skip = svc._sanitize_setting("default_slot", None)
         assert val is None
         assert skip is False
 
     def test_whitespace_only_becomes_none(self, tmp_path):
         svc, _ = make_service(tmp_path)
-        val, skip = svc._sanitize_setting("default_slot", "   ", set())
+        val, skip = svc._sanitize_setting("default_slot", "   ")
         assert val is None
         assert skip is False
 
     def test_nonempty_string_trimmed(self, tmp_path):
         svc, _ = make_service(tmp_path)
-        val, skip = svc._sanitize_setting("default_slot", "  desktop  ", set())
+        val, skip = svc._sanitize_setting("default_slot", "  desktop  ")
         assert val == "desktop"
         assert skip is False
 

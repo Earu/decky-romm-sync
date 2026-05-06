@@ -82,23 +82,21 @@ class TestSaveSyncSettings:
     def test_construction(self):
         s = SaveSyncSettings(
             save_sync_enabled=True,
-            conflict_mode="newest_wins",
             sync_before_launch=True,
             sync_after_exit=True,
-            clock_skew_tolerance_sec=60,
         )
         assert s.save_sync_enabled is True
 
     def test_asdict(self):
         s = SaveSyncSettings(
             save_sync_enabled=False,
-            conflict_mode="ask_me",
             sync_before_launch=False,
             sync_after_exit=False,
-            clock_skew_tolerance_sec=120,
         )
         d = asdict(s)
-        assert d["clock_skew_tolerance_sec"] == 120
+        assert d["save_sync_enabled"] is False
+        assert d["sync_before_launch"] is False
+        assert d["sync_after_exit"] is False
 
 
 class TestSyncResult:

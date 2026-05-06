@@ -628,23 +628,22 @@ class TestSaveSyncSettings:
         """Returns current settings."""
         result = await plugin.get_save_sync_settings()
 
-        assert result["conflict_mode"] == "ask_me"
+        assert result["save_sync_enabled"] is True
         assert result["sync_before_launch"] is True
         assert result["sync_after_exit"] is True
-        assert result["clock_skew_tolerance_sec"] == 60
 
     @pytest.mark.asyncio
     async def test_update_changes_settings(self, plugin, tmp_path):
         """Updates and persists settings."""
         result = await plugin.update_save_sync_settings(
             {
-                "conflict_mode": "always_download",
+                "save_sync_enabled": True,
                 "sync_before_launch": False,
             }
         )
 
         assert result["success"] is True
-        assert result["settings"]["conflict_mode"] == "always_download"
+        assert result["settings"]["save_sync_enabled"] is True
         assert result["settings"]["sync_before_launch"] is False
         # sync_after_exit unchanged
         assert result["settings"]["sync_after_exit"] is True
@@ -652,20 +651,7 @@ class TestSaveSyncSettings:
         # Persisted
         path = tmp_path / "save_sync_state.json"
         data = json.loads(path.read_text())
-        assert data["settings"]["conflict_mode"] == "always_download"
-
-    @pytest.mark.asyncio
-    async def test_invalid_conflict_mode_ignored(self, plugin):
-        """Unknown conflict mode is silently ignored."""
-        result = await plugin.update_save_sync_settings(
-            {
-                "conflict_mode": "invalid_mode",
-            }
-        )
-
-        assert result["success"] is True
-        # Original value preserved
-        assert result["settings"]["conflict_mode"] == "ask_me"
+        assert data["settings"]["save_sync_enabled"] is True
 
     @pytest.mark.asyncio
     async def test_unknown_keys_ignored(self, plugin):
@@ -673,24 +659,13 @@ class TestSaveSyncSettings:
         result = await plugin.update_save_sync_settings(
             {
                 "unknown_key": "value",
-                "conflict_mode": "ask_me",
+                "sync_before_launch": True,
             }
         )
 
         assert result["success"] is True
-        assert result["settings"]["conflict_mode"] == "ask_me"
+        assert result["settings"]["sync_before_launch"] is True
         assert "unknown_key" not in result["settings"]
-
-    @pytest.mark.asyncio
-    async def test_clock_skew_clamped_to_zero(self, plugin):
-        """Negative clock_skew_tolerance_sec clamped to 0."""
-        result = await plugin.update_save_sync_settings(
-            {
-                "clock_skew_tolerance_sec": -10,
-            }
-        )
-
-        assert result["settings"]["clock_skew_tolerance_sec"] == 0
 
     @pytest.mark.asyncio
     async def test_boolean_coercion(self, plugin):

@@ -42,10 +42,8 @@ class SaveSyncSettings:
     """User-facing save sync configuration."""
 
     save_sync_enabled: bool
-    conflict_mode: str
     sync_before_launch: bool
     sync_after_exit: bool
-    clock_skew_tolerance_sec: int
 
 
 @dataclass(frozen=True)
