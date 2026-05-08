@@ -13,7 +13,7 @@ import pytest
 from fakes.fake_save_api import FakeSaveApi
 
 from lib.errors import RommApiError
-from services.saves import SaveService
+from services.saves import SaveService, SaveServiceConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,26 +31,49 @@ def _make_retry():
     return retry
 
 
+_CONFIG_FIELDS = frozenset(
+    {
+        "runtime_dir",
+        "loop",
+        "logger",
+        "get_saves_path",
+        "get_roms_path",
+        "get_active_core",
+        "get_core_name",
+        "plugin_version",
+        "emit",
+        "detect_sort_change",
+        "is_retrodeck_migration_pending",
+    }
+)
+
+
 def make_service(tmp_path, fake_api=None, *, emit=None, **overrides) -> tuple["SaveService", "FakeSaveApi"]:
     """Create a SaveService with sensible defaults for testing."""
     fake: FakeSaveApi = fake_api or FakeSaveApi()
-    defaults: dict[str, Any] = dict(
-        romm_api=fake,
-        retry=_make_retry(),
-        settings={"log_level": "debug"},
-        state={"shortcut_registry": {}, "installed_roms": {}},
-        save_sync_state=SaveService.make_default_state(),
+    config_kwargs: dict[str, Any] = dict(
+        runtime_dir=str(tmp_path),
         loop=asyncio.get_event_loop(),
         logger=logging.getLogger("test"),
-        runtime_dir=str(tmp_path),
         get_saves_path=lambda: str(tmp_path / "saves"),
         get_roms_path=lambda: str(tmp_path / "retrodeck" / "roms"),
         get_active_core=lambda system_name, rom_filename=None: (None, None),
         plugin_version="0.14.0",
         emit=emit,
     )
-    defaults.update(overrides)
-    svc = SaveService(**defaults)
+    ctor_kwargs: dict[str, Any] = dict(
+        romm_api=fake,
+        retry=_make_retry(),
+        settings={"log_level": "debug"},
+        state={"shortcut_registry": {}, "installed_roms": {}},
+        save_sync_state=SaveService.make_default_state(),
+    )
+    for key, value in overrides.items():
+        if key in _CONFIG_FIELDS:
+            config_kwargs[key] = value
+        else:
+            ctor_kwargs[key] = value
+    svc = SaveService(**ctor_kwargs, config=SaveServiceConfig(**config_kwargs))
     svc.init_state()
     return svc, fake
 
@@ -2375,7 +2398,7 @@ class TestSaveSyncSettingsSlotAndCleanup:
 
 
 class TestSaveSlots:
-    """Tests for get_save_slots and set_game_slot."""
+    """Tests for get_save_slots and _set_active_slot."""
 
     @pytest.mark.asyncio
     async def test_get_save_slots(self, tmp_path):
@@ -2443,34 +2466,34 @@ class TestSaveSlots:
         result = await svc.get_save_slots(123)
         assert result["success"] is False
 
-    def test_set_game_slot(self, tmp_path):
+    def test_set_active_slot(self, tmp_path):
         svc, _ = make_service(tmp_path)
         svc._save_sync_state["settings"]["save_sync_enabled"] = True
         svc._save_sync_state["saves"] = {
             "123": {"system": "gba", "active_slot": "default", "files": {}},
         }
-        result = svc.set_game_slot(123, "desktop")
+        result = svc._slots._set_active_slot(123, "desktop")
         assert result["success"] is True
         assert svc._save_sync_state["saves"]["123"]["active_slot"] == "desktop"
 
-    def test_set_game_slot_creates_entry(self, tmp_path):
+    def test_set_active_slot_creates_entry(self, tmp_path):
         svc, _ = make_service(tmp_path)
         svc._save_sync_state["settings"]["save_sync_enabled"] = True
-        result = svc.set_game_slot(456, "my-slot")
+        result = svc._slots._set_active_slot(456, "my-slot")
         assert result["success"] is True
         assert svc._save_sync_state["saves"]["456"]["active_slot"] == "my-slot"
 
-    def test_set_game_slot_empty_sets_none(self, tmp_path):
+    def test_set_active_slot_empty_sets_none(self, tmp_path):
         """Empty string sets active_slot to None (legacy mode)."""
         svc, _ = make_service(tmp_path)
-        result = svc.set_game_slot(123, "")
+        result = svc._slots._set_active_slot(123, "")
         assert result["success"] is True
         assert result["active_slot"] is None
         assert svc._save_sync_state["saves"]["123"]["active_slot"] is None
 
     @pytest.mark.asyncio
-    async def test_set_game_slot_triggers_background_check(self, tmp_path):
-        """set_game_slot fires a background save status check task."""
+    async def test_set_active_slot_triggers_background_check(self, tmp_path):
+        """_set_active_slot fires a background save status check task."""
         emitted = []
 
         async def fake_emit(event, *args):
@@ -2479,7 +2502,7 @@ class TestSaveSlots:
         svc, _ = make_service(tmp_path, emit=fake_emit)
         _install_rom(svc, tmp_path)
 
-        svc.set_game_slot(42, "slot1")
+        svc._slots._set_active_slot(42, "slot1")
 
         # Give the background task a chance to run
         await asyncio.sleep(0.1)
