@@ -216,6 +216,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         save_sync_state_persister=cfg.save_sync_state_persister,
         loop=cfg.loop,
         logger=cfg.logger,
+        clock=cfg.clock,
         get_saves_path=cfg.get_saves_path,
         get_roms_path=cfg.get_roms_path,
         get_active_core=_es_de_config.get_active_core,
@@ -241,6 +242,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         save_sync_state=cfg.save_sync_state,
         loop=cfg.loop,
         logger=cfg.logger,
+        clock=cfg.clock,
         save_state=save_sync_service.save_state,
     )
 
@@ -293,6 +295,9 @@ def wire_services(cfg: WiringConfig) -> dict:
         logger=cfg.logger,
         plugin_dir=cfg.plugin_dir,
         emit=cfg.emit,
+        clock=cfg.clock,
+        uuid_gen=cfg.uuid_gen,
+        sleeper=cfg.sleeper,
         save_state=cfg.save_state,
         save_settings_to_disk=cfg.save_settings_to_disk,
         log_debug=cfg.log_debug,
@@ -311,6 +316,8 @@ def wire_services(cfg: WiringConfig) -> dict:
         logger=cfg.logger,
         runtime_dir=cfg.runtime_dir,
         emit=cfg.emit,
+        clock=cfg.clock,
+        sleeper=cfg.sleeper,
         save_state=cfg.save_state,
         get_roms_path=cfg.get_roms_path,
         get_bios_path=cfg.get_bios_path,
@@ -333,6 +340,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         loop=cfg.loop,
         logger=cfg.logger,
         plugin_dir=cfg.plugin_dir,
+        clock=cfg.clock,
         save_state=cfg.save_state,
         save_firmware_cache=cfg.save_firmware_cache,
         load_firmware_cache=cfg.load_firmware_cache,
@@ -358,6 +366,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         state=cfg.state,
         loop=cfg.loop,
         logger=cfg.logger,
+        clock=cfg.clock,
         log_debug=cfg.log_debug,
     )
 
