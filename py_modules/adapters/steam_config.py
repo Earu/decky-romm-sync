@@ -7,11 +7,14 @@ Steam ``userdata`` directory (resolved from ``DECKY_USER_HOME``).
 from __future__ import annotations
 
 import binascii
+import contextlib
 import logging
 import os
 import struct
 
 import vdf
+
+from lib.errors import SteamGridDirMissingError
 
 
 class SteamConfigAdapter:
@@ -90,6 +93,30 @@ class SteamConfigAdapter:
         with open(tmp_path, "wb") as f:
             f.write(vdf.binary_dumps(data))
         os.replace(tmp_path, path)
+
+    def write_shortcut_icon(self, app_id: int, icon_bytes: bytes) -> str:
+        """Write an icon PNG into Steam's grid dir and return its path.
+
+        Uses a temp file + ``os.replace`` for atomicity; the temp file is
+        cleaned up on any failure before the exception propagates.
+
+        Raises ``lib.errors.SteamGridDirMissingError`` when the Steam grid
+        directory cannot be located.
+        """
+        grid_dir = self.grid_dir()
+        if not grid_dir:
+            raise SteamGridDirMissingError("Cannot find Steam grid directory")
+        icon_path = os.path.join(grid_dir, f"{app_id}_icon.png")
+        tmp_path = icon_path + ".tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(icon_bytes)
+            os.replace(tmp_path, icon_path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
+            raise
+        return icon_path
 
     # -- Steam Input config ---------------------------------------------------
 
