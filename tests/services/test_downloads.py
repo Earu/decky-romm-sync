@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,8 +10,10 @@ import pytest
 from conftest import _make_testable_plugin
 from fakes.system_time import FakeClock, FakeSleeper, FakeUuidGen
 
+from adapters.download_file import DownloadFileAdapter
+from adapters.download_queue import DownloadQueueAdapter
 from adapters.steam_config import SteamConfigAdapter
-from services.downloads import DownloadService
+from services.downloads import DownloadService, DownloadServiceConfig
 from services.library import LibraryService
 from services.rom_removal import RomRemovalService
 
@@ -51,17 +53,21 @@ def plugin():
     p._save_sync_state = {"saves": {}, "playtime": {}, "settings": {}}
     p._download_service = DownloadService(
         romm_api=p._romm_api,
-        resolve_system=p._resolve_system,
         state=p._state,
-        loop=asyncio.get_event_loop(),
-        logger=decky.logger,
-        runtime_dir=decky.DECKY_PLUGIN_RUNTIME_DIR,
-        emit=decky.emit,
-        clock=FakeClock(now=datetime(2026, 1, 1, tzinfo=UTC)),
-        sleeper=FakeSleeper(),
-        save_state=MagicMock(),
-        get_roms_path=lambda: os.path.join(os.path.expanduser("~"), "retrodeck", "roms"),
-        get_bios_path=lambda: os.path.join(os.path.expanduser("~"), "retrodeck", "bios"),
+        download_files=DownloadFileAdapter(),
+        download_queue=DownloadQueueAdapter(),
+        config=DownloadServiceConfig(
+            resolve_system=p._resolve_system,
+            loop=asyncio.get_event_loop(),
+            logger=decky.logger,
+            runtime_dir=decky.DECKY_PLUGIN_RUNTIME_DIR,
+            emit=decky.emit,
+            clock=FakeClock(now=datetime(2026, 1, 1, tzinfo=UTC)),
+            sleeper=FakeSleeper(),
+            save_state=MagicMock(),
+            get_roms_path=lambda: os.path.join(os.path.expanduser("~"), "retrodeck", "roms"),
+            get_bios_path=lambda: os.path.join(os.path.expanduser("~"), "retrodeck", "bios"),
+        ),
     )
     p._rom_removal_service = RomRemovalService(
         state=p._state,
@@ -86,7 +92,7 @@ async def _set_event_loop(plugin):
 class TestStartDownload:
     @pytest.mark.asyncio
     async def test_starts_download_task(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -114,9 +120,9 @@ class TestStartDownload:
             return MagicMock()
 
         plugin._download_service._loop.create_task = _close_coro_task
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(42)
+        result = await plugin.start_download(42)
 
         assert result["success"] is True
         assert 42 in plugin._download_service._download_queue
@@ -143,7 +149,7 @@ class TestStartDownload:
 
     @pytest.mark.asyncio
     async def test_checks_disk_space(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -164,8 +170,8 @@ class TestStartDownload:
         plugin._download_service._loop = MagicMock()
         plugin._download_service._loop.run_in_executor = AsyncMock(return_value=rom_detail)
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=50 * 1024 * 1024)):
-            result = await plugin.start_download(42)
+        plugin._download_service._download_files.disk_free = lambda _path: 50 * 1024 * 1024
+        result = await plugin.start_download(42)
 
         assert result["success"] is False
         assert "disk space" in result["message"].lower()
@@ -440,7 +446,7 @@ class TestDetectLaunchFile:
 class TestDiskSpaceMultiFile:
     @pytest.mark.asyncio
     async def test_multi_file_rom_requires_double_space(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -464,15 +470,15 @@ class TestDiskSpaceMultiFile:
         plugin._download_service._loop.run_in_executor = AsyncMock(return_value=rom_detail)
 
         # 700MB free: enough for single-file (600MB) but not multi-file (1100MB)
-        with patch("shutil.disk_usage", return_value=MagicMock(free=700 * 1024 * 1024)):
-            result = await plugin.start_download(42)
+        plugin._download_service._download_files.disk_free = lambda _path: 700 * 1024 * 1024
+        result = await plugin.start_download(42)
 
         assert result["success"] is False
         assert "disk space" in result["message"].lower()
 
     @pytest.mark.asyncio
     async def test_single_file_rom_uses_normal_space_check(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -497,42 +503,10 @@ class TestDiskSpaceMultiFile:
         plugin._download_service._loop.create_task = MagicMock()
 
         # 700MB free: enough for single-file (600MB)
-        with patch("shutil.disk_usage", return_value=MagicMock(free=700 * 1024 * 1024)):
-            result = await plugin.start_download(43)
+        plugin._download_service._download_files.disk_free = lambda _path: 700 * 1024 * 1024
+        result = await plugin.start_download(43)
 
         assert result["success"] is True
-
-
-class TestPollDownloadRequestsIO:
-    """Tests for _poll_download_requests_io — file-based IPC."""
-
-    def test_reads_and_clears_requests(self, plugin, tmp_path):
-        requests_path = tmp_path / "download_requests.json"
-        requests_path.write_text(json.dumps([{"rom_id": 42}, {"rom_id": 99}]))
-        result = plugin._download_service._poll_download_requests_io(str(requests_path))
-        assert len(result) == 2
-        assert result[0]["rom_id"] == 42
-        assert result[1]["rom_id"] == 99
-        # File should be cleared
-        with open(str(requests_path)) as f:
-            remaining = json.load(f)
-        assert remaining == []
-
-    def test_empty_file_returns_empty(self, plugin, tmp_path):
-        requests_path = tmp_path / "download_requests.json"
-        requests_path.write_text(json.dumps([]))
-        result = plugin._download_service._poll_download_requests_io(str(requests_path))
-        assert result == []
-
-    def test_missing_file_returns_empty(self, plugin, tmp_path):
-        result = plugin._download_service._poll_download_requests_io(str(tmp_path / "nonexistent.json"))
-        assert result == []
-
-    def test_invalid_json_returns_empty(self, plugin, tmp_path):
-        requests_path = tmp_path / "download_requests.json"
-        requests_path.write_text("not valid json {{{{")
-        result = plugin._download_service._poll_download_requests_io(str(requests_path))
-        assert result == []
 
 
 class TestDownloadRequestPolling:
@@ -606,21 +580,17 @@ class TestPollDownloadRequestsMigrationPause:
 
         plugin._download_service._sleeper = _CancellingSleeper()
 
-        # Track whether the request file IO was invoked.
-        io_called = [False]
-        original_io = plugin._download_service._poll_download_requests_io
+        # Track whether the request file IO was invoked via the queue adapter.
+        from conftest import FakeDownloadQueueAdapter
 
-        def tracking_io(path):
-            io_called[0] = True
-            return original_io(path)
-
-        plugin._download_service._poll_download_requests_io = tracking_io
+        tracking_queue = FakeDownloadQueueAdapter()
+        plugin._download_service._download_queue_io = tracking_queue
 
         with pytest.raises(asyncio.CancelledError):
             await plugin._download_service.poll_download_requests()
 
         # IO must NOT have been called while migration was pending.
-        assert io_called[0] is False
+        assert tracking_queue.poll_count == 0
         # Request file must still hold its original contents — not truncated.
         with open(requests_path) as f:
             assert json.load(f) == original_payload
@@ -975,7 +945,7 @@ class TestDoDownloadNestedSingleFile:
     @pytest.mark.asyncio
     async def test_nested_single_file_start_download_uses_files_entry(self, plugin, tmp_path):
         """start_download: nested-single-file enters the queue with the resolved filename."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1005,8 +975,8 @@ class TestDoDownloadNestedSingleFile:
 
         plugin._download_service._loop.create_task = _close_coro_task
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(7)
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
+        result = await plugin.start_download(7)
 
         assert result["success"] is True
         assert plugin._download_service._download_queue[7]["file_name"] == "Resident Evil.chd"
@@ -1015,7 +985,7 @@ class TestDoDownloadNestedSingleFile:
     async def test_nested_single_file_empty_files_falls_back(self, plugin, tmp_path, caplog):
         """Defensive: empty files list falls back to fs_name and logs a warning."""
         import logging
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1044,11 +1014,9 @@ class TestDoDownloadNestedSingleFile:
             return MagicMock()
 
         plugin._download_service._loop.create_task = _close_coro_task
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
 
-        with (
-            caplog.at_level(logging.WARNING, logger="test_romm"),
-            patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)),
-        ):
+        with caplog.at_level(logging.WARNING, logger="test_romm"):
             result = await plugin.start_download(8)
 
         assert result["success"] is True
@@ -1059,7 +1027,7 @@ class TestDoDownloadNestedSingleFile:
     async def test_nested_single_file_missing_files_key_falls_back(self, plugin, tmp_path, caplog):
         """Defensive: missing files key falls back to fs_name and logs a warning."""
         import logging
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1088,11 +1056,9 @@ class TestDoDownloadNestedSingleFile:
             return MagicMock()
 
         plugin._download_service._loop.create_task = _close_coro_task
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
 
-        with (
-            caplog.at_level(logging.WARNING, logger="test_romm"),
-            patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)),
-        ):
+        with caplog.at_level(logging.WARNING, logger="test_romm"):
             result = await plugin.start_download(9)
 
         assert result["success"] is True
@@ -1102,7 +1068,7 @@ class TestDoDownloadNestedSingleFile:
     @pytest.mark.asyncio
     async def test_nested_single_file_traversal_sanitized(self, plugin, tmp_path):
         """Defensive: path traversal in files[0].file_name is sanitized via os.path.basename."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1132,8 +1098,8 @@ class TestDoDownloadNestedSingleFile:
 
         plugin._download_service._loop.create_task = _close_coro_task
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(13)
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
+        result = await plugin.start_download(13)
 
         assert result["success"] is True
         queue_entry = plugin._download_service._download_queue[13]
@@ -1204,7 +1170,7 @@ class TestPathTraversalFsName:
 
     @pytest.mark.asyncio
     async def test_fs_name_traversal_sanitized(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1231,8 +1197,8 @@ class TestPathTraversalFsName:
 
         plugin._download_service._loop.create_task = _close_coro_task
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(77)
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
+        result = await plugin.start_download(77)
 
         assert result["success"] is True
         # The target path should use sanitized basename only
@@ -1372,7 +1338,7 @@ class TestStartDownloadReDownload:
 
     @pytest.mark.asyncio
     async def test_re_download_after_completed(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1402,8 +1368,8 @@ class TestStartDownloadReDownload:
         # Set status to completed (previous download)
         plugin._download_service._download_queue[42] = {"status": "completed"}
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(42)
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
+        result = await plugin.start_download(42)
 
         assert result["success"] is True
         assert plugin._download_service._download_queue[42]["status"] == "downloading"
@@ -1711,24 +1677,41 @@ class TestCleanupLeftoverTmpFiles:
         # No retrodeck/roms directory exists — should not crash
         plugin._download_service.cleanup_leftover_tmp_files()
 
-    def test_handles_permission_error(self, plugin, tmp_path):
+    def test_handles_permission_error(self, plugin, tmp_path, caplog):
+        import logging
+
         import decky
+        from conftest import FakeDownloadFileAdapter
 
         decky.DECKY_USER_HOME = str(tmp_path)
         plugin._download_service._get_roms_path = lambda: str(tmp_path / "retrodeck" / "roms")
         plugin._download_service._get_bios_path = lambda: str(tmp_path / "retrodeck" / "bios")
         plugin._rom_removal_service._get_roms_path = lambda: str(tmp_path / "retrodeck" / "roms")
 
-        system_dir = tmp_path / "retrodeck" / "roms" / "n64"
-        system_dir.mkdir(parents=True)
-        tmp_file = system_dir / "zelda.z64.tmp"
-        tmp_file.write_text("partial")
+        # Stage a virtual tmp file via the fake adapter so the service can
+        # discover it via walk_files_matching_suffixes; the fake's
+        # ``remove_failures`` set makes the subsequent remove raise OSError.
+        roms_base = str(tmp_path / "retrodeck" / "roms")
+        bios_base = str(tmp_path / "retrodeck" / "bios")
+        tmp_file_path = os.path.join(roms_base, "n64", "zelda.z64.tmp")
 
-        with patch("os.remove", side_effect=OSError("Permission denied")):
-            # Should not raise
+        fake = FakeDownloadFileAdapter()
+        fake.make_dirs(roms_base)
+        fake.make_dirs(bios_base)
+        fake.files[tmp_file_path] = b"partial"
+        fake.remove_failures.add(tmp_file_path)
+        plugin._download_service._download_files = fake
+
+        with caplog.at_level(logging.WARNING, logger="test_romm"):
             plugin._download_service.cleanup_leftover_tmp_files()
-        # File still exists since os.remove was mocked to fail
-        assert tmp_file.exists()
+
+        # Per-file warning must be emitted; sister-PR pattern in
+        # SteamGridService.prune_orphaned_artwork_cache.
+        assert any(
+            "Failed to remove tmp file" in rec.message and tmp_file_path in rec.message for rec in caplog.records
+        ), f"expected warning about {tmp_file_path}, got {[r.message for r in caplog.records]}"
+        # File still present in fake — service swallowed the OSError.
+        assert tmp_file_path in fake.files
 
 
 class TestRemoveRomCleansSaveSyncState:
@@ -1886,7 +1869,7 @@ class TestStartDownloadCreateTaskFailure:
 
     @pytest.mark.asyncio
     async def test_create_task_failure_returns_error(self, plugin, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         import decky
 
@@ -1908,32 +1891,13 @@ class TestStartDownloadCreateTaskFailure:
         plugin._download_service._loop.run_in_executor = AsyncMock(return_value=rom_detail)
         plugin._download_service._loop.create_task = MagicMock(side_effect=RuntimeError("loop closed"))
 
-        with patch("shutil.disk_usage", return_value=MagicMock(free=500 * 1024 * 1024)):
-            result = await plugin.start_download(42)
+        plugin._download_service._download_files.disk_free = lambda _path: 500 * 1024 * 1024
+        result = await plugin.start_download(42)
 
         assert result["success"] is False
         assert "Failed to start download" in result["message"]
         # Should not remain in download_in_progress
         assert 42 not in plugin._download_service._download_in_progress
-
-
-class TestRemoveTmpFile:
-    """Tests for _remove_tmp_file helper."""
-
-    def test_removes_existing_file(self, plugin, tmp_path):
-        f = tmp_path / "test.tmp"
-        f.write_text("data")
-        assert plugin._download_service._remove_tmp_file(str(f)) is True
-        assert not f.exists()
-
-    def test_nonexistent_file_returns_false(self, plugin, tmp_path):
-        assert plugin._download_service._remove_tmp_file(str(tmp_path / "nope.tmp")) is False
-
-    def test_os_error_returns_false(self, plugin, tmp_path):
-        f = tmp_path / "test.tmp"
-        f.write_text("data")
-        with patch("os.remove", side_effect=OSError("perm denied")):
-            assert plugin._download_service._remove_tmp_file(str(f)) is False
 
 
 class TestClearCompletedDownloads:
