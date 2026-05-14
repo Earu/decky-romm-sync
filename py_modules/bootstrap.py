@@ -24,6 +24,7 @@ from adapters.persistence import PersistenceAdapter
 from adapters.retroarch_config import RetroArchConfigAdapter
 from adapters.retroarch_core_info import RetroArchCoreInfoAdapter
 from adapters.retrodeck_paths import RetroDeckPathsAdapter
+from adapters.rom_files import RomFileAdapter as RomFileAdapterImpl
 from adapters.romm.http import RommHttpAdapter
 from adapters.romm.romm_api import RommApi
 from adapters.sgdb_artwork_cache import SgdbArtworkCacheAdapter
@@ -36,7 +37,7 @@ from services.artwork import ArtworkService, ArtworkServiceConfig
 from services.connection import ConnectionService, ConnectionServiceConfig
 from services.cores import CoreService, CoreServiceConfig
 from services.downloads import DownloadService, DownloadServiceConfig
-from services.firmware import FirmwareService
+from services.firmware import FirmwareService, FirmwareServiceConfig
 from services.game_detail import GameDetailService
 from services.library import LibraryService, LibraryServiceConfig
 from services.metadata import MetadataService
@@ -59,6 +60,7 @@ from services.protocols import (
     PathExistsProbe,
     RetroArchSaveSortingProvider,
     RetroDeckHomeProvider,
+    RomFileAdapter,
     RommApiProtocol,
     RomsPathProvider,
     SavesPathProvider,
@@ -92,6 +94,7 @@ class AdapterBundle:
     download_queue: DownloadQueueAdapter
     firmware_files: FirmwareFileAdapter
     migration_files: MigrationFileAdapter
+    rom_files: RomFileAdapter
     gamelist_editor: GamelistXmlEditorProtocol
     path_probe: PathExistsProbe
 
@@ -200,6 +203,7 @@ def bootstrap(
     download_queue = DownloadQueueAdapterImpl()
     firmware_files = FirmwareFileAdapterImpl()
     migration_files = MigrationFileAdapterImpl()
+    rom_files = RomFileAdapterImpl()
     path_probe = PathProbeAdapter()
     clock = SystemClock()
     uuid_gen = SystemUuidGen()
@@ -217,6 +221,7 @@ def bootstrap(
         "download_queue": download_queue,
         "firmware_files": firmware_files,
         "migration_files": migration_files,
+        "rom_files": rom_files,
         "path_probe": path_probe,
         "retrodeck_paths": retrodeck_paths,
         "retroarch_config": retroarch_config,
@@ -402,23 +407,26 @@ def wire_services(cfg: WiringConfig) -> dict:
             loop=cfg.runtime.loop,
             save_state=cfg.callbacks.save_state,
             save_save_sync_state=save_sync_service.save_state,
+            rom_files=cfg.adapters.rom_files,
             get_roms_path=cfg.callbacks.get_roms_path,
             download_queue_cleanup=download_service,
         ),
     )
 
     firmware_service = FirmwareService(
-        romm_api=cfg.adapters.romm_api,
-        state=cfg.stores.state,
-        loop=cfg.runtime.loop,
-        logger=cfg.runtime.logger,
-        plugin_dir=cfg.runtime.plugin_dir,
-        clock=cfg.runtime.clock,
-        save_state=cfg.callbacks.save_state,
-        firmware_cache_persister=cfg.callbacks.firmware_cache_persister,
-        firmware_files=cfg.adapters.firmware_files,
-        get_bios_path=cfg.callbacks.get_bios_path,
-        core_info=cfg.callbacks.core_info_provider,
+        config=FirmwareServiceConfig(
+            romm_api=cfg.adapters.romm_api,
+            state=cfg.stores.state,
+            loop=cfg.runtime.loop,
+            logger=cfg.runtime.logger,
+            plugin_dir=cfg.runtime.plugin_dir,
+            clock=cfg.runtime.clock,
+            save_state=cfg.callbacks.save_state,
+            firmware_cache_persister=cfg.callbacks.firmware_cache_persister,
+            firmware_files=cfg.adapters.firmware_files,
+            get_bios_path=cfg.callbacks.get_bios_path,
+            core_info=cfg.callbacks.core_info_provider,
+        ),
     )
 
     sgdb_service = SteamGridService(
