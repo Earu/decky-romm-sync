@@ -500,6 +500,86 @@ class TestDeviceRegistrationServer:
         assert result["success"] is True
         assert result["device_id"] == "existing-id"
 
+    @pytest.mark.asyncio
+    async def test_probes_version_when_unset(self, tmp_path):
+        """ensure_device_registered probes the version when adapter has none."""
+
+        class VersionedFakeApi(FakeSaveApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.heartbeat_calls = 0
+
+            def heartbeat(self) -> dict:
+                self.heartbeat_calls += 1
+                return {"SYSTEM": {"VERSION": "4.8.5"}}
+
+        fake = VersionedFakeApi()
+        svc, _ = make_service(tmp_path, fake_api=fake)
+        svc._save_sync_state["settings"]["save_sync_enabled"] = True
+
+        await svc.ensure_device_registered()
+
+        assert fake.heartbeat_calls == 1
+        assert fake.get_version() == "4.8.5"
+
+    @pytest.mark.asyncio
+    async def test_skips_probe_when_version_already_set(self, tmp_path):
+        """No probe when adapter already has a version."""
+
+        class VersionedFakeApi(FakeSaveApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.heartbeat_calls = 0
+
+            def heartbeat(self) -> dict:
+                self.heartbeat_calls += 1
+                return {"SYSTEM": {"VERSION": "4.8.5"}}
+
+        fake = VersionedFakeApi()
+        fake.set_version("4.8.1")
+        svc, _ = make_service(tmp_path, fake_api=fake)
+        svc._save_sync_state["settings"]["save_sync_enabled"] = True
+
+        await svc.ensure_device_registered()
+
+        assert fake.heartbeat_calls == 0
+        assert fake.get_version() == "4.8.1"
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_is_non_fatal(self, tmp_path):
+        """Heartbeat failure during version probe does not prevent registration."""
+        fake = FakeSaveApi()
+        fake.heartbeat_raises = ConnectionError("offline")
+        svc, _ = make_service(tmp_path, fake_api=fake)
+        svc._save_sync_state["settings"]["save_sync_enabled"] = True
+
+        result = await svc.ensure_device_registered()
+
+        assert result["success"] is True
+        assert fake.get_version() is None
+
+    @pytest.mark.asyncio
+    async def test_probe_skipped_when_disabled(self, tmp_path):
+        """Disabled save sync short-circuits before any probe."""
+
+        class VersionedFakeApi(FakeSaveApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.heartbeat_calls = 0
+
+            def heartbeat(self) -> dict:
+                self.heartbeat_calls += 1
+                return {"SYSTEM": {"VERSION": "4.8.5"}}
+
+        fake = VersionedFakeApi()
+        svc, _ = make_service(tmp_path, fake_api=fake)
+        # save_sync_enabled defaults to False
+        result = await svc.ensure_device_registered()
+
+        assert result["success"] is False
+        assert result.get("disabled") is True
+        assert fake.heartbeat_calls == 0
+
 
 # ---------------------------------------------------------------------------
 # TestListDevices
@@ -2862,8 +2942,14 @@ class TestConfirmSlotChoice:
         assert saved["saves"]["42"]["slot_confirmed"] is True
 
     @pytest.mark.asyncio
-    async def test_confirm_with_migration(self, tmp_path):
-        """Migrate: re-upload to new slot, delete old."""
+    async def test_confirm_with_legacy_no_slot_migration(self, tmp_path):
+        """Migrate: re-upload to new slot, delete old.
+
+        ``None`` for ``migrate_from_slot`` means "migrate from legacy
+        no-slot server saves". Facade translates ``None`` to the
+        no-migration sentinel, so this exercises ``SlotsService`` directly
+        where the legacy ``None`` semantics still live.
+        """
         svc, fake = make_service(tmp_path)
         svc._save_sync_state["settings"]["save_sync_enabled"] = True
         svc._save_sync_state["device_id"] = "dev-1"
@@ -2873,7 +2959,7 @@ class TestConfirmSlotChoice:
         # Old save on server with slot=None (legacy)
         fake.saves[1] = _server_save(save_id=1, slot=None)
 
-        result = await svc.confirm_slot_choice(42, "default", migrate_from_slot=None)
+        result = await svc._slots.confirm_slot_choice(42, "default", migrate_from_slot=None)
         assert result["success"] is True
         # New save should have been uploaded
         upload_calls = [c for c in fake.call_log if c[0] == "upload_save"]
@@ -2907,7 +2993,12 @@ class TestConfirmSlotChoice:
 
     @pytest.mark.asyncio
     async def test_confirm_migration_failure_still_confirms_slot(self, tmp_path):
-        """Migration failure should still confirm the slot but report the issue."""
+        """Migration failure should still confirm the slot but report the issue.
+
+        Exercises ``SlotsService`` directly because the facade translates
+        ``None`` to the no-migration sentinel; legacy ``None`` migration
+        semantics live on the slots service.
+        """
         svc, fake = make_service(tmp_path)
         svc._save_sync_state["settings"]["save_sync_enabled"] = True
         svc._save_sync_state["device_id"] = "dev-1"
@@ -2922,10 +3013,50 @@ class TestConfirmSlotChoice:
 
         fake.upload_save = failing_upload
 
-        result = await svc.confirm_slot_choice(42, "default", migrate_from_slot=None)
+        result = await svc._slots.confirm_slot_choice(42, "default", migrate_from_slot=None)
         assert result["success"] is True
         assert "migration failed" in result["message"].lower()
         # Slot is still confirmed despite migration failure
+        assert svc._save_sync_state["saves"]["42"]["slot_confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_facade_translates_none_to_no_migration(self, tmp_path):
+        """Facade: ``None`` for ``migrate_from_slot`` skips migration."""
+        svc, fake = make_service(tmp_path)
+        svc._save_sync_state["settings"]["save_sync_enabled"] = True
+        svc._save_sync_state["device_id"] = "dev-1"
+        svc._save_sync_state["server_device_id"] = "dev-1"
+        _install_rom(svc, tmp_path)
+        _create_save(tmp_path)
+        fake.saves[1] = _server_save(save_id=1, slot=None)
+
+        result = await svc.confirm_slot_choice(42, "default", migrate_from_slot=None)
+        assert result["success"] is True
+        # No migration occurred — no uploads / no deletes
+        upload_calls = [c for c in fake.call_log if c[0] == "upload_save"]
+        assert len(upload_calls) == 0
+        delete_calls = [c for c in fake.call_log if c[0] == "delete_server_saves"]
+        assert len(delete_calls) == 0
+        assert svc._save_sync_state["saves"]["42"]["slot_confirmed"] is True
+
+    @pytest.mark.asyncio
+    async def test_facade_translates_no_migration_string_to_no_migration(self, tmp_path):
+        """Facade: ``"__no_migration__"`` string (from frontend) skips migration."""
+        svc, fake = make_service(tmp_path)
+        svc._save_sync_state["settings"]["save_sync_enabled"] = True
+        svc._save_sync_state["device_id"] = "dev-1"
+        svc._save_sync_state["server_device_id"] = "dev-1"
+        _install_rom(svc, tmp_path)
+        _create_save(tmp_path)
+        fake.saves[1] = _server_save(save_id=1, slot=None)
+
+        result = await svc.confirm_slot_choice(42, "default", migrate_from_slot="__no_migration__")
+        assert result["success"] is True
+        # No migration occurred — no uploads / no deletes
+        upload_calls = [c for c in fake.call_log if c[0] == "upload_save"]
+        assert len(upload_calls) == 0
+        delete_calls = [c for c in fake.call_log if c[0] == "delete_server_saves"]
+        assert len(delete_calls) == 0
         assert svc._save_sync_state["saves"]["42"]["slot_confirmed"] is True
 
     @pytest.mark.asyncio

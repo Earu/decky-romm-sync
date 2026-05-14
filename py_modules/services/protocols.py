@@ -29,8 +29,17 @@ class RommApiProtocol(Protocol):
     Requires RomM >= 4.8.1.
     """
 
-    def set_version(self, version: str) -> None:
-        """Store the detected RomM server version string."""
+    def set_version(self, version: str | None) -> None:
+        """Store the detected RomM server version string.
+
+        Passing ``None`` clears the cached version (used when the server
+        becomes unreachable and the cached version should no longer be
+        trusted).
+        """
+        ...
+
+    def get_version(self) -> str | None:
+        """Return the detected RomM server version string, or ``None`` if unset."""
         ...
 
     def heartbeat(self) -> dict:
@@ -361,6 +370,20 @@ class PendingSyncReader(Protocol):
     """
 
     def __call__(self) -> dict: ...
+
+
+class DownloadQueueCleanup(Protocol):
+    """Eviction seam for the in-memory ROM download queue.
+
+    Consumed by ``RomRemovalService`` to remove queue entries when a ROM
+    is deleted. Exposing this as a Protocol avoids a service-to-service
+    concrete import and keeps the typed seam narrow to "evict one entry"
+    and "clear all entries".
+    """
+
+    def evict(self, rom_id: int) -> None: ...
+
+    def clear(self) -> None: ...
 
 
 class SaveSyncStatePersister(Protocol):

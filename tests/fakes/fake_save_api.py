@@ -42,8 +42,11 @@ class FakeSaveApi:
     # Unimplemented RommApiProtocol methods (use MagicMock for these)
     # ------------------------------------------------------------------
 
-    def set_version(self, version: str) -> None:
-        raise NotImplementedError
+    def set_version(self, version: str | None) -> None:
+        self.version = version
+
+    def get_version(self) -> str | None:
+        return getattr(self, "version", None)
 
     def heartbeat(self) -> dict:
         if self.heartbeat_raises is not None:

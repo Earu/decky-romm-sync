@@ -27,6 +27,7 @@ from adapters.persistence import (
 from adapters.retroarch_config import RetroArchConfigAdapter
 from adapters.retroarch_core_info import RetroArchCoreInfoAdapter
 from adapters.retrodeck_paths import RetroDeckPathsAdapter
+from domain.version import meets_min_version
 from lib.migration_gate import migration_blocked
 
 
@@ -174,7 +175,6 @@ class Plugin:
             "save_sort_settings": None,
         }
         self._metadata_cache = {}
-        self._romm_version = None  # Detected on test_connection
         self._state = self._persistence.load_state(self._state)
         self._state = migrate_state(self._state)
         self._metadata_cache = self._persistence.load_metadata_cache()
@@ -284,12 +284,7 @@ class Plugin:
         return self._migration_service.dismiss_retrodeck_migration()
 
     async def refresh_migration_state(self):
-        self._migration_service.detect_retrodeck_path_change()
-        self._migration_service.detect_save_sort_change()
-        return {
-            "retrodeck": await self._migration_service.get_migration_status(),
-            "save_sort": await self._migration_service.get_save_sort_migration_status(),
-        }
+        return await self._migration_service.refresh_state()
 
     async def _unload(self):  # Decky lifecycle — must be async
         self._sync_service.shutdown()
@@ -297,15 +292,6 @@ class Plugin:
         decky.logger.info("RomM Sync plugin unloaded")
 
     _MIN_REQUIRED_VERSION = (4, 8, 1)
-
-    @staticmethod
-    def _meets_min_version(version_str: str) -> bool:
-        """Return True if *version_str* (e.g. ``'4.8.1'``) >= ``_MIN_REQUIRED_VERSION``."""
-        try:
-            parts = tuple(int(p) for p in version_str.split("."))
-        except (ValueError, AttributeError):
-            return False
-        return parts >= Plugin._MIN_REQUIRED_VERSION
 
     # ── Callables ──────────────────────────────────────────────────────
     # All methods below are exposed to the frontend via Decky's callable()
@@ -321,16 +307,16 @@ class Plugin:
         try:
             heartbeat = await self.loop.run_in_executor(None, self._romm_api.heartbeat)
         except Exception as e:
-            self._romm_version = None
+            self._romm_api.set_version(None)
             return error_response(e)
 
         # Extract server version from heartbeat
-        self._romm_version = None
+        version: str | None = None
         with contextlib.suppress(AttributeError, TypeError):
-            self._romm_version = heartbeat.get("SYSTEM", {}).get("VERSION")
-        if self._romm_version:
-            decky.logger.info(f"RomM server version: {self._romm_version}")
-            self._romm_api.set_version(self._romm_version)
+            version = heartbeat.get("SYSTEM", {}).get("VERSION")
+        self._romm_api.set_version(version)
+        if version:
+            decky.logger.info(f"RomM server version: {version}")
 
         # Test authenticated access
         try:
@@ -342,31 +328,30 @@ class Plugin:
             return resp
 
         # Enforce minimum version
-        version = self._romm_version
-        if version and version != "development" and not self._meets_min_version(version):
+        if version and version != "development" and not meets_min_version(version, self._MIN_REQUIRED_VERSION):
             min_str = ".".join(str(v) for v in self._MIN_REQUIRED_VERSION)
             return {
                 "success": False,
                 "message": (
                     f"This plugin requires RomM {min_str} or newer. "
-                    f"Your server is running {self._romm_version}. "
+                    f"Your server is running {version}. "
                     "Please update your RomM server to continue using this plugin."
                 ),
                 "error_code": "version_error",
-                "romm_version": self._romm_version,
+                "romm_version": version,
             }
 
         result = {"success": True, "message": "Connected to RomM"}
-        if self._romm_version and self._romm_version != "development":
-            result["message"] = f"Connected to RomM {self._romm_version}"
-            result["romm_version"] = self._romm_version
-        elif self._romm_version == "development":
-            result["romm_version"] = self._romm_version
+        if version and version != "development":
+            result["message"] = f"Connected to RomM {version}"
+            result["romm_version"] = version
+        elif version == "development":
+            result["romm_version"] = version
         return result
 
     async def get_romm_version(self):
-        """Return cached RomM version (detected on last test_connection)."""
-        return {"version": self._romm_version}
+        """Return cached RomM version (detected on last test_connection or device probe)."""
+        return {"version": self._romm_api.get_version()}
 
     async def save_settings(self, romm_url, romm_user, romm_pass, allow_insecure_ssl=None):
         try:
@@ -615,7 +600,7 @@ class Plugin:
         return await self._shortcut_removal_service.report_removal_results(removed_rom_ids)
 
     async def get_artwork_base64(self, rom_id):
-        return await self._artwork_service.get_artwork_base64(int(rom_id), self._sync_service.pending_sync)
+        return await self._artwork_service.get_artwork_base64(int(rom_id))
 
     @migration_blocked
     async def clear_sync_cache(self):
@@ -648,31 +633,15 @@ class Plugin:
 
     @migration_blocked
     async def remove_rom(self, rom_id):
-        result = await self._rom_removal_service.remove_rom(rom_id)
-        if result.get("success"):
-            self._download_service._download_queue.pop(int(rom_id), None)
-        return result
+        return await self._rom_removal_service.remove_rom(rom_id)
 
     @migration_blocked
     async def uninstall_all_roms(self):
-        result = await self._rom_removal_service.uninstall_all_roms()
-        if result.get("success"):
-            self._download_service._download_queue.clear()
-        return result
+        return await self._rom_removal_service.uninstall_all_roms()
 
     # ── Save Sync / Playtime delegation to services ──────────
 
     async def ensure_device_registered(self):
-        # Ensure RomM version is detected before device registration.
-        if not getattr(self, "_romm_version", None):
-            try:
-                heartbeat = await self.loop.run_in_executor(None, self._romm_api.heartbeat)
-                with contextlib.suppress(AttributeError, TypeError):
-                    self._romm_version = heartbeat.get("SYSTEM", {}).get("VERSION")
-                if self._romm_version:
-                    self._romm_api.set_version(self._romm_version)
-            except Exception as e:
-                decky.logger.debug(f"ensure_device_registered: heartbeat failed (non-fatal): {e}")
         return await self._save_sync_service.ensure_device_registered()
 
     async def list_devices(self):
@@ -721,11 +690,7 @@ class Plugin:
 
     @migration_blocked
     async def confirm_slot_choice(self, rom_id, chosen_slot, migrate_from_slot="__no_migration__"):
-        from services.saves import _NO_MIGRATION
-
-        # null from frontend = None in Python — treat same as no migration
-        actual = _NO_MIGRATION if migrate_from_slot in ("__no_migration__", None) else migrate_from_slot
-        return await self._save_sync_service.confirm_slot_choice(rom_id, chosen_slot, actual)
+        return await self._save_sync_service.confirm_slot_choice(rom_id, chosen_slot, migrate_from_slot)
 
     @migration_blocked
     async def sync_all_saves(self):

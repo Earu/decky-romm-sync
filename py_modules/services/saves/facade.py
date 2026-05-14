@@ -423,6 +423,23 @@ class SaveService:
         if not self._is_save_sync_enabled():
             return {"success": False, "device_id": "", "device_name": "", "disabled": True}
 
+        # Probe the RomM version when it has not been observed yet. Device
+        # registration is the entrypoint reached from background launchers
+        # that never call test_connection first, so the version on the API
+        # adapter would otherwise stay None and version-gated server-side
+        # features couldn't be enabled until the next manual connection
+        # test. Probe failures are non-fatal — the registration call below
+        # still proceeds and the adapter just retains its current version.
+        if not self._romm_api.get_version():
+            try:
+                heartbeat = await self._loop.run_in_executor(None, self._romm_api.heartbeat)
+                with contextlib.suppress(AttributeError, TypeError):
+                    version = heartbeat.get("SYSTEM", {}).get("VERSION")
+                    if version:
+                        self._romm_api.set_version(version)
+            except Exception as e:
+                self._logger.debug(f"ensure_device_registered: version probe failed (non-fatal): {e}")
+
         # Already registered
         has_device_id = self._save_sync_state.get("device_id")
         has_server_id = self._save_sync_state.get("server_device_id")
@@ -772,7 +789,14 @@ class SaveService:
         chosen_slot: str,
         migrate_from_slot: str | None | object = _NO_MIGRATION,
     ) -> dict:
-        """Confirm which slot to use for a game's save sync."""
+        """Confirm which slot to use for a game's save sync.
+
+        ``migrate_from_slot`` may be the ``_NO_MIGRATION`` sentinel, ``None``,
+        or ``"__no_migration__"`` (the string the frontend sends when no
+        migration is requested). All three are treated as "no migration".
+        """
+        if migrate_from_slot is None or migrate_from_slot == "__no_migration__":
+            migrate_from_slot = _NO_MIGRATION
         return await self._slots.confirm_slot_choice(rom_id, chosen_slot, migrate_from_slot)
 
     async def sync_all_saves(self) -> dict:

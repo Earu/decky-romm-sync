@@ -18,9 +18,13 @@ class RommApi:
         self._client = client
         self._version: str | None = None
 
-    def set_version(self, version: str) -> None:
-        """Store the detected server version string."""
+    def set_version(self, version: str | None) -> None:
+        """Store the detected server version string. ``None`` clears the cache."""
         self._version = version
+
+    def get_version(self) -> str | None:
+        """Return the detected server version string, or ``None`` if unset."""
+        return self._version
 
     # ── Server / Auth ─────────────────────────────────────────────────
 
