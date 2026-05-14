@@ -17,6 +17,7 @@ from adapters.cover_art_file_store import CoverArtFileStoreAdapter
 from adapters.download_file import DownloadFileAdapter as DownloadFileAdapterImpl
 from adapters.download_queue import DownloadQueueAdapter as DownloadQueueAdapterImpl
 from adapters.es_de_config import CoreResolver, GamelistXmlEditor
+from adapters.firmware_file import FirmwareFileAdapter as FirmwareFileAdapterImpl
 from adapters.migration_file import MigrationFileAdapter as MigrationFileAdapterImpl
 from adapters.persistence import PersistenceAdapter
 from adapters.retroarch_config import RetroArchConfigAdapter
@@ -49,6 +50,7 @@ from services.protocols import (
     DownloadQueueAdapter,
     EventEmitter,
     FirmwareCachePersister,
+    FirmwareFileAdapter,
     MigrationFileAdapter,
     RetroArchSaveSortingProvider,
     RetroDeckHomeProvider,
@@ -81,6 +83,7 @@ class AdapterBundle:
     sgdb_artwork_cache: SgdbArtworkCache
     download_files: DownloadFileAdapter
     download_queue: DownloadQueueAdapter
+    firmware_files: FirmwareFileAdapter
     migration_files: MigrationFileAdapter
 
 
@@ -185,6 +188,7 @@ def bootstrap(
     sgdb_artwork_cache = SgdbArtworkCacheAdapter(runtime_dir=runtime_dir)
     download_files = DownloadFileAdapterImpl()
     download_queue = DownloadQueueAdapterImpl()
+    firmware_files = FirmwareFileAdapterImpl()
     migration_files = MigrationFileAdapterImpl()
     clock = SystemClock()
     uuid_gen = SystemUuidGen()
@@ -200,6 +204,7 @@ def bootstrap(
         "sgdb_artwork_cache": sgdb_artwork_cache,
         "download_files": download_files,
         "download_queue": download_queue,
+        "firmware_files": firmware_files,
         "migration_files": migration_files,
         "retrodeck_paths": retrodeck_paths,
         "retroarch_config": retroarch_config,
@@ -387,6 +392,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         clock=cfg.runtime.clock,
         save_state=cfg.callbacks.save_state,
         firmware_cache_persister=cfg.callbacks.firmware_cache_persister,
+        firmware_files=cfg.adapters.firmware_files,
         get_bios_path=cfg.callbacks.get_bios_path,
         core_info=cfg.callbacks.core_info_provider,
     )

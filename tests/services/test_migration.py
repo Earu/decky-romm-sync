@@ -7,6 +7,7 @@ import pytest
 from conftest import FakeCoreInfoProvider, FakeFirmwareCachePersister, FakeMigrationFileAdapter
 from fakes.system_time import FakeClock, FakeSleeper, FakeUuidGen
 
+from adapters.firmware_file import FirmwareFileAdapter
 from adapters.migration_file import MigrationFileAdapter
 from adapters.persistence import PersistenceAdapter
 from adapters.steam_config import SteamConfigAdapter
@@ -48,6 +49,7 @@ def plugin():
         clock=FakeClock(now=datetime(2026, 1, 1, tzinfo=UTC)),
         save_state=MagicMock(),
         firmware_cache_persister=FakeFirmwareCachePersister(),
+        firmware_files=FirmwareFileAdapter(),
         get_bios_path=MagicMock(return_value=""),
         core_info=FakeCoreInfoProvider(),
     )
