@@ -192,6 +192,65 @@ class RommRomReader(Protocol):
         ...
 
 
+class RommSaveApi(Protocol):
+    """RomM saves API surface (list, up/download, confirm, summary, delete)."""
+
+    def list_saves(
+        self,
+        rom_id: int,
+        *,
+        device_id: str | None = None,
+        slot: str | None = None,
+    ) -> list[dict]:
+        """Return saves for ``rom_id``; ``device_id`` enriches with device_syncs and ``slot`` filters."""
+        ...
+
+    def upload_save(
+        self,
+        rom_id: int,
+        file_path: str,
+        emulator: str,
+        save_id: int | None = None,
+        *,
+        device_id: str | None = None,
+        slot: str | None = None,
+        overwrite: bool = False,
+    ) -> dict:
+        """Upload (or replace) a save; raises ``RommConflictError`` on 409 unless ``overwrite=True``."""
+        ...
+
+    def download_save_content(
+        self,
+        save_id: int,
+        dest_path: str,
+        *,
+        device_id: str | None = None,
+        optimistic: bool = True,
+    ) -> None:
+        """Stream save content; ``optimistic=False`` with ``device_id`` defers the sync ack to ``confirm_download``."""
+        ...
+
+    def confirm_download(self, save_id: int, device_id: str) -> dict:
+        """Acknowledge a deferred-sync save download (paired with ``optimistic=False``)."""
+        ...
+
+    def get_save_summary(self, rom_id: int, device_id: str | None = None) -> dict:
+        """Return ``/api/saves/summary`` grouped by slot; ``device_id`` includes per-device sync status."""
+        ...
+
+    def download_save(self, save_id: int, dest_path: str) -> None:
+        """Stream a single save file to ``dest_path`` via ``/api/saves/{save_id}/content``."""
+        ...
+
+    def get_save_metadata(self, save_id: int) -> dict:
+        """Return save metadata for ``save_id``."""
+        ...
+
+    def delete_server_saves(self, save_ids: list[int]) -> dict:
+        """Delete the given save ids via ``POST /api/saves/delete``."""
+        ...
+
+
 class RommVersion(Protocol):
     """RomM server identity & health-check surface."""
 
