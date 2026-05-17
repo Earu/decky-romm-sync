@@ -29,6 +29,7 @@ import {
 import { removeShortcut } from "../utils/steamShortcuts";
 import { scrollToTop } from "../utils/scrollHelpers";
 import { clearPlatformCollection, clearAllRomMCollections } from "../utils/collections";
+import { formatUninstallStatus } from "../utils/formatters";
 import type { RegistryPlatform } from "../types";
 
 const DEFAULT_WHITELIST_PATTERNS: string[] = [
@@ -190,7 +191,7 @@ const ShortcutRemovalSection: FC<ShortcutRemovalSectionProps> = ({
     try {
       setUninstallStatus("Uninstalling...");
       const result = await uninstallAllRoms();
-      setUninstallStatus(result.message);
+      setUninstallStatus(formatUninstallStatus(result.removed_count, result.errors.length));
     } catch {
       setUninstallStatus("Failed to uninstall ROMs");
     }
