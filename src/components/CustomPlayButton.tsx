@@ -39,6 +39,7 @@ import {
 import { getRommConnectionState } from "../utils/connectionState";
 import { scrollToTop } from "../utils/scrollHelpers";
 import { getEventTarget } from "../utils/events";
+import { applyLaunchGateSetupOutcome, resolveSaveSetupOutcome } from "../utils/saveSetup";
 import { showCoreChangeModal } from "./CoreChangeModal";
 import { showSyncConflictModal } from "./SyncConflictModal";
 import type { DownloadProgressEvent, DownloadCompleteEvent, SyncConflict } from "../types";
@@ -264,32 +265,22 @@ export const CustomPlayButton: FC<CustomPlayButtonProps> = ({ appId }) => { // N
     );
   };
 
-  // Save-slot tracking gate. Auto-configures the default slot for scenarios
-  // where no server saves exist; otherwise toasts + switches to the saves tab
-  // and tells the caller to bail. Returns "proceed" | "abort".
+  // Save-slot tracking gate. Delegates branch handling to applyLaunchGateSetupOutcome
+  // so the per-outcome side effects (toast + saves-tab switch vs auto-confirm) stay
+  // testable without rendering this component.
   const ensureTrackingConfigured = async (rid: number): Promise<"proceed" | "abort"> => {
     const trackingResult = await isSaveTrackingConfigured(rid).catch(() => ({ configured: true }));
     if (trackingResult.configured) return "proceed";
     try {
       const setupInfo = await getSaveSetupInfo(rid);
-      if (!setupInfo.has_local_saves && setupInfo.server_slots.length === 0) {
-        // No saves anywhere — auto-configure with default, proceed
-        await confirmSlotChoice(rid, setupInfo.default_slot, null);
-        return "proceed";
-      }
-      if (setupInfo.has_local_saves && setupInfo.server_slots.length === 0) {
-        // Scenario B: local saves, no server — auto-configure
-        await confirmSlotChoice(rid, setupInfo.default_slot, null);
-        return "proceed";
-      }
-      // Server has saves — user must configure in saves tab
-      toaster.toast({
-        title: "RomM Save Sync",
-        body: "Configure save sync in the Saves tab first",
+      const outcome = resolveSaveSetupOutcome(setupInfo);
+      return applyLaunchGateSetupOutcome(outcome, {
+        rid,
+        confirmSlotChoice,
+        toast: (body) => toaster.toast({ title: "RomM Save Sync", body }),
+        dispatchSavesTab: () =>
+          globalThis.dispatchEvent(new CustomEvent("romm_tab_switch", { detail: { tab: "saves" } })),
       });
-      // Switch to saves tab
-      globalThis.dispatchEvent(new CustomEvent("romm_tab_switch", { detail: { tab: "saves" } }));
-      return "abort";
     } catch {
       // If check fails, proceed with launch anyway
       return "proceed";
