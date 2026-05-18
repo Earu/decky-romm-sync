@@ -4,23 +4,14 @@
  * belongs here; rendering helpers live alongside their components.
  */
 
-import type { DeviceSyncInfo, SaveStatus, SyncConflict } from "../../types";
-import type { SlotDeleteInfo } from "../../api/backend";
+import type { DeviceSyncInfo, SaveStatus, SyncConflict, SlotDeleteInfo } from "../../types";
 
-const MUTED_COLOR = "#8f98a0";
+export const MUTED_COLOR = "#8f98a0";
 
 /** Display a slot name, using "(no slot)" for null/empty values */
 export function displaySlot(slot: string | null | undefined): string {
   if (slot === null || slot === undefined || slot === "") return "(no slot)";
   return slot;
-}
-
-/** Format a byte count as a human-readable string (e.g. "12.4 KB") */
-export function formatBytes(bytes: number | null): string {
-  if (bytes == null) return "";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Format a relative time string (e.g. "5m ago", "2h ago") from an ISO string */

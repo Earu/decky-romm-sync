@@ -48,8 +48,6 @@ import * as connectionState from "../utils/connectionState";
 import type {
   MigrationStatus,
   SaveSortMigrationStatus,
-} from "../api/backend";
-import type {
   SyncStats,
   SyncPreview,
   SyncPreviewSummary,

@@ -21,8 +21,8 @@ from adapters.asyncio_sleeper import AsyncioSleeper
 from adapters.cover_art_file_store import CoverArtFileStoreAdapter
 from adapters.debug_logger import SettingsAwareDebugLogger
 from adapters.download_file import DownloadFileAdapter
-from adapters.download_queue import DownloadQueueAdapter as DownloadQueueAdapterImpl
-from adapters.es_de_config import CoreResolver, GamelistXmlEditor
+from adapters.download_queue import DownloadQueueAdapter
+from adapters.es_de_config import CoreResolver, GamelistXmlEditorAdapter
 from adapters.firmware_file import FirmwareFileAdapter
 from adapters.hostname import HostnameAdapter
 from adapters.migration_file import MigrationFileAdapter
@@ -70,15 +70,15 @@ from services.protocols import (
     CoverArtFileStore,
     DebugLogger,
     DownloadFileStore,
-    DownloadQueueAdapter,
+    DownloadQueueStore,
     EventEmitter,
     FirmwareCachePersister,
     FirmwareFileStore,
-    GamelistXmlEditorProtocol,
-    HostnameProvider,
+    GamelistXmlEditor,
+    HostnameReader,
     MetadataCachePersister,
     MigrationFileStore,
-    PathExistsProbe,
+    PathExistsReader,
     PluginMetadataReader,
     RetroArchSaveSortingProvider,
     RetroDeckPaths,
@@ -125,13 +125,13 @@ class AdapterBundle:
     cover_art_file_store: CoverArtFileStore
     sgdb_artwork_cache: SgdbArtworkCache
     download_file_store: DownloadFileStore
-    download_queue: DownloadQueueAdapter
+    download_queue: DownloadQueueStore
     firmware_file_store: FirmwareFileStore
     migration_file_store: MigrationFileStore
     rom_file_store: RomFileStore
     save_file_store: SaveFileStore
-    gamelist_editor: GamelistXmlEditorProtocol
-    path_probe: PathExistsProbe
+    gamelist_editor: GamelistXmlEditor
+    path_probe: PathExistsReader
     core_info_provider: CoreInfoProvider
 
 
@@ -157,7 +157,7 @@ class RuntimeBundle:
     clock: Clock
     uuid_gen: UuidGen
     sleeper: Sleeper
-    hostname_provider: HostnameProvider
+    hostname_provider: HostnameReader
 
 
 @dataclass(frozen=True)
@@ -178,7 +178,7 @@ class CallbackBundle:
 
 @dataclass(frozen=True)
 class RuntimeAdaptersBundle:
-    """Concrete adapters for the Clock/UuidGen/Sleeper/HostnameProvider seams.
+    """Concrete adapters for the Clock/UuidGen/Sleeper/HostnameReader seams.
 
     Bootstrap owns adapter instantiation, but the ``RuntimeBundle``
     handed to ``wire_services`` also needs runtime-only state ``main.py``
@@ -190,7 +190,7 @@ class RuntimeAdaptersBundle:
     clock: Clock
     uuid_gen: UuidGen
     sleeper: Sleeper
-    hostname_provider: HostnameProvider
+    hostname_provider: HostnameReader
 
 
 @dataclass(frozen=True)
@@ -289,7 +289,7 @@ def bootstrap(
         logger=logger,
         get_retrodeck_home=retrodeck_paths.retrodeck_home,
     )
-    gamelist_editor = GamelistXmlEditor(logger=logger)
+    gamelist_editor = GamelistXmlEditorAdapter(logger=logger)
 
     persistence = PersistenceAdapter(settings_dir, runtime_dir, logger)
     firmware_cache_persister = FirmwareCachePersisterAdapter(persistence)
@@ -321,7 +321,7 @@ def bootstrap(
     cover_art_file_store = CoverArtFileStoreAdapter()
     sgdb_artwork_cache = SgdbArtworkCacheAdapter(runtime_dir=runtime_dir)
     download_file_store = DownloadFileAdapter()
-    download_queue = DownloadQueueAdapterImpl()
+    download_queue = DownloadQueueAdapter()
     firmware_file_store = FirmwareFileAdapter()
     migration_file_store = MigrationFileAdapter()
     rom_file_store = RomFileAdapter()

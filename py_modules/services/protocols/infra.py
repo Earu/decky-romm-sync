@@ -24,7 +24,7 @@ class DebugLogger(Protocol):
     def __call__(self, msg: str) -> None: ...
 
 
-class HostnameProvider(Protocol):
+class HostnameReader(Protocol):
     """Local device hostname source.
 
     Services consume this Protocol instead of ``socket.gethostname``
@@ -37,7 +37,7 @@ class HostnameProvider(Protocol):
         ...
 
 
-class PathExistsProbe(Protocol):
+class PathExistsReader(Protocol):
     """Generic filesystem existence probe.
 
     Used by services that need to check whether a path is currently
