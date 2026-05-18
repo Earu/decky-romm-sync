@@ -85,6 +85,10 @@ class TestSaveSlots:
         svc, _ = make_service(tmp_path)
         result = await svc.get_save_slots(123)
         assert result["success"] is False
+        assert result["reason"] == "sync_disabled"
+        assert "disabled" in result["message"].lower()
+        assert result["slots"] == []
+        assert result["active_slot"] == "default"
 
     @pytest.mark.asyncio
     async def test_get_save_slots_preserves_map_on_api_failure(self, tmp_path):
@@ -122,9 +126,10 @@ class TestSaveSlots:
 
         # Response indicates failure with the carried-over active slot.
         assert result["success"] is False
+        assert result["reason"] == "server_unreachable"
         assert result["slots"] == []
         assert result["active_slot"] == "default"
-        assert "connection refused" in result["error"]
+        assert "connection refused" in result["message"]
         # In-memory slot map is untouched (no merge / overwrite happened).
         assert svc._save_sync_state.saves["123"].slots == original_slots
         # On-disk state is unchanged — no save_state() call after the failure.
@@ -704,9 +709,10 @@ class TestGetSlotSaves:
         result = await svc.get_slot_saves(42, "default")
 
         assert result["success"] is False
+        assert result["reason"] == "server_unreachable"
         assert result["slot"] == "default"
         assert result["saves"] == []
-        assert "connection timeout" in result["error"]
+        assert "connection timeout" in result["message"]
 
     @pytest.mark.asyncio
     async def test_sync_disabled(self, tmp_path):
@@ -717,9 +723,10 @@ class TestGetSlotSaves:
         result = await svc.get_slot_saves(42, "default")
 
         assert result["success"] is False
+        assert result["reason"] == "sync_disabled"
         assert result["slot"] == "default"
         assert result["saves"] == []
-        assert "disabled" in result["error"].lower()
+        assert "disabled" in result["message"].lower()
 
 
 class TestSwitchSlot:
@@ -1170,8 +1177,11 @@ class TestDeleteSlot:
 
         assert result["success"] is False
         assert result["reason"] == "server_unreachable"
-        assert result["error"] == "server_unreachable"
         assert "message" in result
+        # Drift guard: the legacy duplicate ``error`` field was dropped in #652.
+        # Frontend now reads ``reason`` only. Re-adding ``error`` would
+        # reintroduce the dual-write that was deliberately removed.
+        assert "error" not in result
         # Critically: no fake "0 saves" count that would let the confirm modal
         # render "delete 0 saves".
         assert "server_save_count" not in result
