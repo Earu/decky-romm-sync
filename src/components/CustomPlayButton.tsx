@@ -40,9 +40,10 @@ import { getRommConnectionState } from "../utils/connectionState";
 import { scrollToTop } from "../utils/scrollHelpers";
 import { getEventTarget } from "../utils/events";
 import { applyLaunchGateSetupOutcome, resolveSaveSetupOutcome } from "../utils/saveSetup";
+import { handleButtonDownloadFailure } from "../utils/downloadFailure";
 import { showCoreChangeModal } from "./CoreChangeModal";
 import { showSyncConflictModal } from "./SyncConflictModal";
-import type { DownloadProgressEvent, DownloadCompleteEvent, SyncConflict } from "../types";
+import type { DownloadProgressEvent, DownloadCompleteEvent, DownloadFailedEvent, SyncConflict } from "../types";
 
 type PlayButtonState = "loading" | "not_romm" | "download" | "conflict" | "syncing" | "play" | "launching" | "dl_complete" | "uninstalling";
 
@@ -201,6 +202,19 @@ export const CustomPlayButton: FC<CustomPlayButtonProps> = ({ appId }) => { // N
       },
     );
 
+    /* istanbul ignore next -- listener-wiring; logic tested in src/utils/downloadFailure.test.ts */
+    const failedListener = addEventListener<[DownloadFailedEvent]>(
+      "download_failed",
+      // The global listener in index.tsx owns the failure toast; here we only
+      // reset local UI so the user can retry.
+      (evt: DownloadFailedEvent) =>
+        handleButtonDownloadFailure(evt, romIdRef.current, () => {
+          setDlProgress(null);
+          setActionPending(false);
+          setState("download");
+        }),
+    );
+
     const onUninstall = (e: Event) => {
       const romId = (e as CustomEvent).detail?.rom_id;
       if (romId !== romIdRef.current) return;
@@ -234,6 +248,7 @@ export const CustomPlayButton: FC<CustomPlayButtonProps> = ({ appId }) => { // N
     return () => {
       removeEventListener("download_progress", progressListener);
       removeEventListener("download_complete", completeListener);
+      removeEventListener("download_failed", failedListener);
       globalThis.removeEventListener("romm_rom_uninstalled", onUninstall);
       globalThis.removeEventListener("romm_data_changed", onDataChanged);
       globalThis.removeEventListener("romm_connection_changed", onConnectionChanged);
