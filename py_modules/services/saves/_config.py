@@ -15,7 +15,6 @@ from domain.save_state import SaveSyncState
 if TYPE_CHECKING:
     import asyncio
     import logging
-    from collections.abc import Callable
 
     from services.protocols import (
         Clock,
@@ -24,11 +23,13 @@ if TYPE_CHECKING:
         DebugLogger,
         EventEmitter,
         HostnameProvider,
+        MigrationPendingFn,
         PluginMetadataReader,
         RetroDeckPaths,
         RetryStrategy,
         RommSyncApi,
         SaveFileAdapter,
+        SaveSortChangeFn,
         SaveSyncStatePersister,
     )
 
@@ -144,5 +145,5 @@ class SaveServiceConfig:
     plugin_dir: str
     get_core_name: CoreNameProviderFn | None = None
     emit: EventEmitter | None = None
-    detect_sort_change: Callable[[], None] | None = None
-    is_retrodeck_migration_pending: Callable[[], bool] | None = None
+    detect_sort_change: SaveSortChangeFn | None = None
+    is_retrodeck_migration_pending: MigrationPendingFn | None = None
