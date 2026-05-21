@@ -520,7 +520,7 @@ class TestFinishSync:
 
         assert plugin._sync_service._sync_state == SyncState.IDLE
         assert plugin._sync_service._sync_progress["running"] is False
-        assert plugin._sync_service._sync_progress["phase"] == "cancelled"
+        assert plugin._sync_service._sync_progress["stage"] == "cancelled"
         assert plugin._sync_service._sync_progress["message"] == "Sync cancelled"
 
     @pytest.mark.asyncio
@@ -534,6 +534,38 @@ class TestFinishSync:
         await plugin._sync_service._orchestrator._finish_sync("Sync cancelled")
 
         assert plugin._sync_service._current_sync_id is None
+
+
+class TestGetSyncStatus:
+    """Backend-authoritative sync status query.
+
+    ``get_sync_status`` returns the persisted progress snapshot so a
+    freshly remounted QAM can recover in-flight state without waiting on
+    a live ``sync_progress`` event.
+    """
+
+    def test_returns_idle_default_when_no_sync(self, plugin):
+        status = plugin._sync_service.get_sync_status()
+        assert status["running"] is False
+        assert status["stage"] == ""
+
+    def test_returns_live_snapshot_mid_sync(self, plugin):
+        snapshot = {
+            "running": True,
+            "stage": "applying",
+            "current": 3,
+            "total": 10,
+            "message": "N64 (1/2)",
+            "step": 1,
+            "totalSteps": 2,
+        }
+        plugin._sync_service._sync_progress = snapshot
+
+        status = plugin._sync_service.get_sync_status()
+
+        assert status == snapshot
+        assert status["running"] is True
+        assert status["stage"] == "applying"
 
 
 class TestSyncPreviewErrorHandling:
@@ -870,6 +902,51 @@ class TestDoSyncPerUnit:
         assert stale_events[0] == {"remove_rom_ids": []}
 
     @pytest.mark.asyncio
+    async def test_stale_entries_pruned_from_registry_after_finalize(self, plugin, fake_romm_api):
+        """End-to-end: a stale registry entry (disabled platform) is removed from the
+        backend registry during finalize, not just from the frontend via ``sync_stale``.
+
+        Regression for the inflated ``get_sync_stats`` count: the orchestrator emits
+        ``sync_stale`` so the frontend drops the shortcut, and the reporter now also
+        prunes the same rom_ids from ``shortcut_registry`` so ``len(registry)`` matches
+        the still-synced ROMs.
+        """
+        import decky
+
+        decky.emit.reset_mock()
+        plugin.loop = asyncio.get_event_loop()
+        _use_fake_romm(plugin, fake_romm_api)
+
+        # rom_id 10 is the live N64 ROM (synced this run). rom_id 99 is a leftover
+        # from a now-disabled platform — present in the registry but in no enabled unit.
+        plugin._state["last_sync"] = "2025-01-01T00:00:00Z"
+        plugin._state["shortcut_registry"] = {
+            "10": {"name": "A", "fs_name": "a.z64", "platform_name": "N64", "platform_slug": "n64", "app_id": 1000},
+            "99": {"name": "Z", "fs_name": "z.gba", "platform_name": "GBA", "platform_slug": "gba", "app_id": 9900},
+        }
+        fake_romm_api.platforms = [{"id": 1, "name": "N64", "slug": "n64", "rom_count": 1}]
+        plugin.settings["enabled_platforms"] = {"1": True}
+
+        plugin._sync_service._orchestrator._download_artwork = AsyncMock(return_value={})
+        plugin._sync_service._orchestrator._wait_for_unit_complete = AsyncMock(return_value={})
+        plugin._sync_service._reporter.commit_unit_results = AsyncMock()  # type: ignore[method-assign]
+        plugin._sync_service._sync_state = SyncState.RUNNING
+
+        await plugin._sync_service._orchestrator._do_sync_per_unit()
+
+        # Frontend was told to remove rom_id 99.
+        stale_events = [c.args[1] for c in decky.emit.call_args_list if c.args and c.args[0] == "sync_stale"]
+        assert stale_events == [{"remove_rom_ids": [99]}]
+
+        # Backend registry was pruned to match — only the synced ROM remains.
+        assert set(plugin._state["shortcut_registry"].keys()) == {"10"}
+
+        # get_sync_stats reflects the pruned count, not the pre-sync inflated count.
+        stats = await plugin.get_sync_stats()
+        assert stats["roms"] == 1
+        assert stats["total_shortcuts"] == 1
+
+    @pytest.mark.asyncio
     async def test_downloads_artwork_when_not_skipped(self, plugin, fake_romm_api):
         import decky
 
@@ -950,6 +1027,96 @@ class TestDoSyncPerUnit:
         complete_events = [c[0][1] for c in decky.emit.call_args_list if c[0][0] == "sync_complete"]
         assert len(complete_events) == 1
         assert complete_events[0].get("cancelled") is True
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_emits_finalizing_running(self, plugin, fake_romm_api):
+        """A normal-completion run emits a non-terminal finalizing snapshot
+        after the unit loop, before the reporter's terminal done emit."""
+        import decky
+
+        decky.emit.reset_mock()
+        plugin.loop = asyncio.get_event_loop()
+        _use_fake_romm(plugin, fake_romm_api)
+
+        _seed_platform(
+            fake_romm_api,
+            platform_id=1,
+            name="N64",
+            slug="n64",
+            roms=[{"id": 10, "name": "A"}],
+        )
+        plugin._state["last_sync"] = None
+        plugin._state["shortcut_registry"] = {}
+        plugin.settings["enabled_platforms"] = {"1": True}
+
+        plugin._sync_service._orchestrator._download_artwork = AsyncMock(return_value={})
+        plugin._sync_service._orchestrator._wait_for_unit_complete = _fake_wait_set_event
+        plugin._sync_service._sync_state = SyncState.RUNNING
+
+        await plugin._sync_service._orchestrator._do_sync_per_unit()
+
+        finalizing = [
+            c.args[1]
+            for c in decky.emit.call_args_list
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "finalizing"
+        ]
+        assert len(finalizing) == 1
+        assert finalizing[0]["running"] is True
+        # The terminal done snapshot still follows it (running:false).
+        done = [
+            c.args[1]
+            for c in decky.emit.call_args_list
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "done"
+        ]
+        assert len(done) == 1
+        assert done[0]["running"] is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_run_does_not_emit_finalizing(self, plugin, fake_romm_api):
+        """A cancelled run skips the finalizing snapshot — its terminal emit
+        is the reporter's cancelled snapshot."""
+        import decky
+
+        decky.emit.reset_mock()
+        plugin.loop = asyncio.get_event_loop()
+        _use_fake_romm(plugin, fake_romm_api)
+
+        _seed_platform(
+            fake_romm_api,
+            platform_id=1,
+            name="N64",
+            slug="n64",
+            roms=[{"id": 10, "name": "A"}],
+        )
+        _seed_platform(
+            fake_romm_api,
+            platform_id=2,
+            name="GBA",
+            slug="gba",
+            roms=[{"id": 20, "name": "B"}],
+        )
+        plugin._state["last_sync"] = None
+        plugin._state["shortcut_registry"] = {}
+        plugin.settings["enabled_platforms"] = {"1": True, "2": True}
+
+        plugin._sync_service._orchestrator._download_artwork = AsyncMock(return_value={})
+
+        async def fake_wait(_u, event):
+            event.set()
+            plugin._sync_service._sync_state = SyncState.CANCELLING
+            return {}
+
+        plugin._sync_service._orchestrator._wait_for_unit_complete = fake_wait
+        plugin._sync_service._sync_state = SyncState.RUNNING
+
+        await plugin._sync_service._orchestrator._do_sync_per_unit()
+
+        finalizing = [
+            c.args[1]
+            for c in decky.emit.call_args_list
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "finalizing"
+        ]
+        assert finalizing == []
 
 
 class TestWaitForUnitComplete:
@@ -1131,10 +1298,10 @@ class TestDoSyncPerUnitErrors:
         # _finish_sync transitioned to IDLE + cleared sync id.
         assert plugin._sync_service._sync_state == SyncState.IDLE
         assert plugin._sync_service._current_sync_id is None
-        progress_phases = [
-            c.args[1].get("phase") for c in decky.emit.call_args_list if c.args and c.args[0] == "sync_progress"
+        progress_stages = [
+            c.args[1].get("stage") for c in decky.emit.call_args_list if c.args and c.args[0] == "sync_progress"
         ]
-        assert "cancelled" in progress_phases
+        assert "cancelled" in progress_stages
 
     @pytest.mark.asyncio
     async def test_build_work_queue_general_exception_emits_error(self, plugin, fake_romm_api):
@@ -1155,7 +1322,7 @@ class TestDoSyncPerUnitErrors:
         error_events = [
             c
             for c in decky.emit.call_args_list
-            if c.args and c.args[0] == "sync_progress" and c.args[1].get("phase") == "error"
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "error"
         ]
         assert len(error_events) >= 1
         assert plugin._sync_service._sync_state == SyncState.IDLE
@@ -1187,7 +1354,7 @@ class TestDoSyncPerUnitErrors:
         error_events = [
             c
             for c in decky.emit.call_args_list
-            if c.args and c.args[0] == "sync_progress" and c.args[1].get("phase") == "error"
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "error"
         ]
         assert len(error_events) >= 1
         assert "Sync failed" in error_events[0].args[1]["message"]
@@ -1246,7 +1413,7 @@ class TestDoSyncPerUnitErrors:
         error_events = [
             c
             for c in decky.emit.call_args_list
-            if c.args and c.args[0] == "sync_progress" and c.args[1].get("phase") == "error"
+            if c.args and c.args[0] == "sync_progress" and c.args[1].get("stage") == "error"
         ]
         assert len(error_events) >= 1
         assert plugin._sync_service._sync_state == SyncState.IDLE
