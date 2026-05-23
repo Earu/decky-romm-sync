@@ -7,7 +7,6 @@ import pytest
 from models.registry_patches import (
     RegistryCoverPathPatch,
     RegistryDeletePatch,
-    RegistryIdsPatch,
     RegistrySgdbIdPatch,
     RegistrySyncApplyPatch,
 )
@@ -166,57 +165,34 @@ class TestApplySgdbId:
         assert entry["cover_path"] == "/covers/old.png"
 
 
-class TestApplyIds:
-    def test_both_none_is_noop_existing_entry_unchanged(self, store, state):
-        state["shortcut_registry"]["42"] = _make_existing_entry(sgdb_id=555, igdb_id=666)
-        before = dict(state["shortcut_registry"]["42"])
+class TestApplySyncSgdbId:
+    """Sync-write merge for ``sgdb_id`` — RomM is the source of truth.
 
-        store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=None, igdb_id=None))
+    A fresh RomM id on the patch overwrites the stored one; when the
+    patch carries no id, the existing id is preserved.
+    """
 
-        assert state["shortcut_registry"]["42"] == before
-
-    def test_both_none_on_missing_entry_is_noop(self, store, state, caplog):
-        with caplog.at_level(logging.WARNING):
-            store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=None, igdb_id=None))
-
-        assert "42" not in state["shortcut_registry"]
-        # No warning either — there's nothing to apply, so the missing-row
-        # branch isn't reached.
-        assert not any("apply_ids" in rec.message for rec in caplog.records)
-
-    def test_only_sgdb_id_leaves_igdb_id_untouched(self, store, state):
-        state["shortcut_registry"]["42"] = _make_existing_entry(igdb_id=666)
-
-        store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=888, igdb_id=None))
-
-        entry = state["shortcut_registry"]["42"]
-        assert entry["sgdb_id"] == 888
-        assert entry["igdb_id"] == 666
-
-    def test_only_igdb_id_leaves_sgdb_id_untouched(self, store, state):
+    def test_patch_id_overwrites_existing(self, store, state):
         state["shortcut_registry"]["42"] = _make_existing_entry(sgdb_id=555)
 
-        store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=None, igdb_id=999))
+        store.apply_sync(_base_sync_patch(sgdb_id=999))
 
         entry = state["shortcut_registry"]["42"]
-        assert entry["igdb_id"] == 999
+        assert entry["sgdb_id"] == 999
+
+    def test_existing_id_preserved_when_patch_carries_no_id(self, store, state):
+        state["shortcut_registry"]["42"] = _make_existing_entry(sgdb_id=555)
+
+        store.apply_sync(_base_sync_patch())  # sgdb_id defaults to None
+
+        entry = state["shortcut_registry"]["42"]
         assert entry["sgdb_id"] == 555
 
-    def test_both_set_writes_both(self, store, state):
-        state["shortcut_registry"]["42"] = _make_existing_entry()
-
-        store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=888, igdb_id=999))
+    def test_no_sgdb_id_anywhere_leaves_field_absent(self, store, state):
+        store.apply_sync(_base_sync_patch())
 
         entry = state["shortcut_registry"]["42"]
-        assert entry["sgdb_id"] == 888
-        assert entry["igdb_id"] == 999
-
-    def test_missing_entry_with_value_warns(self, store, state, caplog):
-        with caplog.at_level(logging.WARNING):
-            store.apply_ids(RegistryIdsPatch(rom_id_str="42", sgdb_id=888, igdb_id=None))
-
-        assert "42" not in state["shortcut_registry"]
-        assert any("apply_ids" in rec.message for rec in caplog.records)
+        assert "sgdb_id" not in entry
 
 
 class TestDelete:

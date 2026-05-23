@@ -586,6 +586,13 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => { //
   // --- Game Info section ---
   const gameInfoChildren: ReturnType<typeof createElement>[] = [];
 
+  // The RomM game name (distinct from the Steam shortcut hero title, which can differ).
+  if (state.romName) {
+    gameInfoChildren.push(
+      createElement("div", { key: "rom-name", className: "romm-panel-rom-name" }, state.romName),
+    );
+  }
+
   if (meta) {
     if (meta.summary) {
       gameInfoChildren.push(
@@ -641,7 +648,7 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => { //
     : [createElement("div", { key: "no-meta", className: "romm-panel-muted" }, "No metadata available")];
 
   const gameInfoSection = state.coverBase64
-    ? section("game-info", "Game Info",
+    ? section("game-info", null,
         createElement("div", {
           key: "game-info-row",
           style: { display: "flex", gap: "16px", alignItems: "flex-start" },
@@ -654,7 +661,7 @@ export const RomMGameInfoPanel: FC<RomMGameInfoPanelProps> = ({ appId }) => { //
           createElement("div", { key: "details", style: { flex: 1 } }, ...gameInfoContent),
         ),
       )
-    : section("game-info", "Game Info", ...gameInfoContent);
+    : section("game-info", null, ...gameInfoContent);
 
   // --- ROM File section (only when installed) ---
   const romFileSection = state.installed && state.installedRom

@@ -51,24 +51,12 @@ class RegistryCoverPathPatch:
 class RegistrySgdbIdPatch:
     """Write of ``sgdb_id`` only.
 
-    Owner: SteamGridDB lazy lookup. The store no-ops on a missing row.
+    Owner: SteamGridDB resolution and the manual picker. The store
+    no-ops on a missing row.
     """
 
     rom_id_str: str
     sgdb_id: int
-
-
-@dataclass(frozen=True)
-class RegistryIdsPatch:
-    """Write of ``sgdb_id`` and/or ``igdb_id``.
-
-    Owner: SteamGridDB RomM-API fetch. ``None`` on either field means
-    "leave that field alone"; if both are ``None`` the call is a no-op.
-    """
-
-    rom_id_str: str
-    sgdb_id: int | None
-    igdb_id: int | None
 
 
 @dataclass(frozen=True)

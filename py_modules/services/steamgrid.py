@@ -10,24 +10,28 @@ All raw I/O is delegated to adapters (``SgdbArtworkCache``,
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from models.registry_patches import RegistryIdsPatch, RegistrySgdbIdPatch
+from models.registry_patches import RegistrySgdbIdPatch
 from models.state import PluginState
 
 from domain.sgdb_artwork import (
     asset_type_endpoint,
     asset_type_name,
+    build_autocomplete_path,
+    classify_resolution,
+    first_grid_url,
+    parse_autocomplete_results,
     sgdb_endpoint_path,
     to_signed_app_id,
 )
 from lib.errors import SgdbApiError, SteamGridDirMissingError
 
 if TYPE_CHECKING:
-    import asyncio
     import logging
 
     from services.protocols import (
@@ -135,49 +139,178 @@ class SteamGridService:
             self._logger.warning(f"Failed to read file {path}: {e}")
             return None
 
-    async def _resolve_sgdb_id(self, rom_id):
-        """Resolve SGDB game ID from registry, pending sync, RomM API, or IGDB lookup."""
+    def _resolve_sgdb_id_state_only(self, rom_id):
+        """Resolve a SGDB game ID from local state only — no network.
+
+        Checks the persisted registry row first, then the in-memory
+        pending-sync map. Returns ``None`` when neither carries a
+        ``sgdb_id``. RomM re-reads and IGDB cross-refs are gated behind
+        the explicit ``get_sgdb_resolution`` user action, not this
+        passive lookup.
+        """
         rom_id_str = str(rom_id)
         reg = self._state["shortcut_registry"].get(rom_id_str, {})
         sgdb_id = reg.get("sgdb_id")
-        igdb_id = reg.get("igdb_id")
-
         if not sgdb_id:
             pending = self._get_pending_sync().get(rom_id, {})
             sgdb_id = pending.get("sgdb_id")
-            igdb_id = igdb_id or pending.get("igdb_id")
-
-        # On-demand fetch from RomM API for pre-existing ROMs missing IDs
-        if not sgdb_id:
-            sgdb_id, igdb_id = await self._fetch_ids_from_romm(rom_id, igdb_id)
-
-        # Fallback: look up SGDB via IGDB ID
-        if not sgdb_id and igdb_id:
-            sgdb_id = await self._loop.run_in_executor(None, self._get_sgdb_game_id, igdb_id)
-            if sgdb_id:
-                self._registry_store.apply_sgdb_id(RegistrySgdbIdPatch(rom_id_str=rom_id_str, sgdb_id=sgdb_id))
-                self._state_persister.save_state()
-
         return sgdb_id
 
-    async def _fetch_ids_from_romm(self, rom_id, igdb_id):
-        """Fetch sgdb_id and igdb_id from RomM API and update registry."""
-        rom_id_str = str(rom_id)
+    async def _fetch_ids_from_romm(self, rom_id):
+        """Fetch ``(sgdb_id, igdb_id, rom_data)`` from RomM without persisting.
+
+        Reads the ROM detail from RomM and surfaces its ``sgdb_id`` /
+        ``igdb_id`` fields. Persistence is the caller's decision — this
+        method never writes the registry. Returns ``(None, None, None)``
+        on a network failure (logged, never raised).
+        """
         sgdb_id = None
+        igdb_id = None
+        rom_data = None
         try:
             rom_data = await self._loop.run_in_executor(None, self._romm_api.get_rom, rom_id)
             if rom_data:
                 sgdb_id = rom_data.get("sgdb_id")
-                igdb_id = igdb_id or rom_data.get("igdb_id")
+                igdb_id = rom_data.get("igdb_id")
             self._log_debug(f"SGDB artwork: fetched sgdb_id={sgdb_id}, igdb_id={igdb_id} from RomM for rom_id={rom_id}")
-            if sgdb_id or igdb_id:
-                self._registry_store.apply_ids(
-                    RegistryIdsPatch(rom_id_str=rom_id_str, sgdb_id=sgdb_id or None, igdb_id=igdb_id or None)
-                )
-                self._state_persister.save_state()
         except Exception as e:
             self._logger.warning(f"SGDB artwork: failed to fetch IDs from RomM for rom_id={rom_id}: {e}")
-        return sgdb_id, igdb_id
+        return sgdb_id, igdb_id, rom_data
+
+    def _persist_sgdb_id(self, rom_id_str, sgdb_id):
+        """Write a resolved ``sgdb_id`` and flush state."""
+        self._registry_store.apply_sgdb_id(RegistrySgdbIdPatch(rom_id_str=rom_id_str, sgdb_id=int(sgdb_id)))
+        self._state_persister.save_state()
+
+    def _first_grid_thumb(self, sgdb_id):
+        """Return a thumbnail URL for *sgdb_id*'s first grid, or ``None``.
+
+        Synchronous — callers offload via ``run_in_executor``. Network
+        and parse errors are swallowed to ``None`` so a preview thumbnail
+        never breaks the resolution flow.
+        """
+        try:
+            payload = self._sgdb_api.request(f"/grids/game/{sgdb_id}?limit=1")
+            return first_grid_url(payload)
+        except Exception as e:
+            self._logger.warning(f"SGDB grid thumb lookup failed for game {sgdb_id}: {e}")
+            return None
+
+    # -- resolution cascade (callable) -------------------------------------
+
+    async def get_sgdb_resolution(self, rom_id):
+        """Resolve which SGDB game id to use for *rom_id*, picker-driven.
+
+        The single explicit user action that may re-read RomM and run the
+        IGDB cross-ref / name-search cascade. RomM's ``sgdb_id`` always
+        wins when present. Returns one of:
+
+        - ``{"decision": "no_api_key"}`` — no key configured.
+        - ``{"decision": "resolved", "sgdb_id": int}`` — a winning id was
+          found (and persisted when it came from RomM or IGDB).
+        - ``{"decision": "needs_pick", "candidates": [...]}`` — nothing
+          resolved automatically; offer a manual name-search picker.
+        """
+        rom_id = int(rom_id)
+        rom_id_str = str(rom_id)
+        if not self._settings.get("steamgriddb_api_key"):
+            return {"decision": "no_api_key"}
+
+        state_id = self._resolve_sgdb_id_state_only(rom_id)
+        romm_id, igdb_id, rom_data = await self._fetch_ids_from_romm(rom_id)
+
+        decision = classify_resolution(state_id, romm_id)
+        if decision == "use_romm" and romm_id is not None:
+            if romm_id != state_id:
+                self._persist_sgdb_id(rom_id_str, romm_id)
+            return {"decision": "resolved", "sgdb_id": int(romm_id)}
+        if decision == "use_state" and state_id is not None:
+            return {"decision": "resolved", "sgdb_id": int(state_id)}
+
+        # Unresolved: try IGDB cross-ref, then fall back to a name search.
+        if igdb_id:
+            resolved = await self._loop.run_in_executor(None, self._get_sgdb_game_id, igdb_id)
+            if resolved:
+                self._persist_sgdb_id(rom_id_str, resolved)
+                return {"decision": "resolved", "sgdb_id": int(resolved)}
+
+        name = (rom_data or {}).get("name") or ""
+        search = await self.search_sgdb_games(name)
+        return {"decision": "needs_pick", "candidates": search.get("games", [])}
+
+    async def search_sgdb_games(self, term):
+        """Search SGDB by name and enrich the top candidates with thumbnails.
+
+        Returns ``{"success": bool, "games": [{"id", "name",
+        "release_year", "thumb_url"}]}``. Returns an empty, unsuccessful
+        result when no API key is configured. Network failures are
+        logged and surfaced as ``{"success": False, "games": []}`` — the
+        callable never raises.
+        """
+        if not self._settings.get("steamgriddb_api_key"):
+            return {"success": False, "games": []}
+        try:
+            path = build_autocomplete_path(str(term))
+            payload = await self._loop.run_in_executor(None, self._sgdb_api.request, path)
+            candidates = parse_autocomplete_results(payload)
+        except Exception as e:
+            self._logger.warning(f"SGDB name search failed for term={term!r}: {e}")
+            return {"success": False, "games": []}
+
+        capped = candidates[:6]
+        thumb_futures = [
+            self._loop.run_in_executor(None, self._first_grid_thumb, candidate["id"]) for candidate in capped
+        ]
+        thumbs = await asyncio.gather(*thumb_futures)
+        games = [
+            {
+                "id": candidate["id"],
+                "name": candidate["name"],
+                "release_year": candidate["release_year"],
+                "thumb_url": thumb,
+            }
+            for candidate, thumb in zip(capped, thumbs, strict=True)
+        ]
+        return {"success": True, "games": games}
+
+    async def apply_sgdb_game_id(self, rom_id, sgdb_id):
+        """Paint a manually-picked game's artwork into *rom_id*'s cache.
+
+        A manual pick only paints pixels — it downloads the chosen
+        game's four asset types into the rom's artwork cache (which the
+        cache-first ``get_sgdb_artwork_base64`` then serves onto the
+        Steam shortcut) and persists **nothing**. Only authoritative ids
+        (RomM ``sgdb_id`` or an IGDB cross-ref) are remembered as the
+        resolved id; a manual pick is not. So a later "Refresh Artwork"
+        on an otherwise-unresolvable rom stays ``needs_pick`` and reopens
+        the picker, giving the user a free re-pick. The previously
+        applied art stays visible until replaced.
+        """
+        rom_id = int(rom_id)
+        sgdb_id = int(sgdb_id)
+
+        # Start clean: ``_download_sgdb_artwork`` early-returns an
+        # existing cache file, so a re-pick of a different game must
+        # evict the prior PNGs before downloading.
+        await self._loop.run_in_executor(None, self._clear_cached_artwork, rom_id)
+
+        downloads = [
+            self._loop.run_in_executor(None, self._download_sgdb_artwork, sgdb_id, rom_id, asset_type)
+            for asset_type in ("hero", "logo", "grid", "icon")
+        ]
+        await asyncio.gather(*downloads)
+        return {"success": True}
+
+    def _clear_cached_artwork(self, rom_id):
+        """Remove the four cached artwork PNGs for *rom_id* (sync)."""
+        art_dir = self._sgdb_artwork_cache.cache_dir()
+        for asset_type in ("hero", "logo", "grid", "icon"):
+            path = os.path.join(art_dir, f"{rom_id}_{asset_type}.png")
+            if self._sgdb_artwork_cache.exists(path):
+                try:
+                    self._sgdb_artwork_cache.remove_file(path)
+                except OSError as e:
+                    self._logger.warning(f"Failed to clear cached artwork {path}: {e}")
 
     async def get_sgdb_artwork_base64(self, rom_id, asset_type_num):
         rom_id = int(rom_id)
@@ -201,7 +334,7 @@ class SteamGridService:
             self._log_debug("SGDB artwork skipped: no API key configured")
             return {"base64": None, "no_api_key": True}
 
-        sgdb_id = await self._resolve_sgdb_id(rom_id)
+        sgdb_id = self._resolve_sgdb_id_state_only(rom_id)
         if not sgdb_id:
             self._log_debug(f"SGDB artwork skipped: no SGDB game found for rom_id={rom_id}")
             return {"base64": None, "no_api_key": False}
