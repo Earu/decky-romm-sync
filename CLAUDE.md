@@ -6,9 +6,11 @@ A Decky Loader plugin that syncs a self-hosted RomM library into Steam as Non-St
 
 ## Documentation
 
-The docs live in `docs/` and are the canonical source for architecture, file structure, and feature documentation. They are built with **Material for MkDocs** and published to GitHub Pages (<https://danielcopper.github.io/decky-romm-sync/>) by `.github/workflows/docs.yml` on every push to `main`. Because the docs sit in this repo, doc updates are reviewed in the same PR as the code change — when a change affects architecture, data flows, or feature behavior, update the relevant page under `docs/` in that same PR. Preview locally with `mise run docs`.
+**Docs are updated in the same PR as the code change. This is not optional.** When a change affects architecture, data flows, feature behavior, or user-facing UI, the relevant page under `docs/` must be updated in the same PR. Documentation-debt-as-a-separate-follow-up-issue is forbidden — those follow-ups never land. If you're not sure whether a change needs docs, the default is "yes, it does." Enforced in CI by `.github/workflows/docs-check.yml`.
 
-Layout mirrors the three nav tabs: `docs/user-guide/` (end users), `docs/architecture/` (how it works), `docs/contributing/` (dev setup). The old GitHub Wiki is retired — it only redirects to the published site.
+The docs live in `docs/` and are the canonical source for architecture, file structure, and feature documentation. Built with **Material for MkDocs** and published to GitHub Pages (<https://danielcopper.github.io/decky-romm-sync/>) by `.github/workflows/docs.yml` on every push to `main`. Layout mirrors the three nav tabs: `docs/user-guide/` (end users), `docs/architecture/` (how it works), `docs/contributing/` (dev setup). The old GitHub Wiki is retired — it only redirects to the published site. Preview locally with `mise run docs`.
+
+For genuinely doc-irrelevant PRs (pure refactor with no user-visible change, no architecture shift, no new flow; tooling/CI changes; dependency bumps), set the `no-docs-change` label on the PR OR include `docs: N/A` (with a one-line reason) in the PR description. The default posture is "docs needed"; opting out is an explicit acknowledgement, not a silent omission. The CI check enforces this.
 
 ## Key Technical Constraints
 
@@ -72,6 +74,13 @@ Backend layout: `services/` (orchestration) / `adapters/` (I/O) / `domain/` (pur
 **Adapters**: `[CP]` Own all I/O. Never import from `services/`. Implement Protocols defined in `services/protocols.py`. (Canonical ports-and-adapters.)
 
 **Domain**: `[CP]` Pure compute only. No I/O, no state mutation, no service or adapter imports. Functions take inputs, return outputs. Anything stateless and I/O-free that's currently in a service belongs here. (Canonical domain-model purity.)
+
+**Aggregates** (CP chapters 1–7 scope — locked in #788, applies as the SQLite migration #271 lands):
+
+- `[CP]` One Repository Protocol per aggregate root, not per table. Aggregate boundaries are domain-modeling decisions; table layout is downstream and may need multiple tables to back one aggregate.
+- `[CP]` Aggregate methods are the **only** mutation API for the aggregate's state. No external field assignment (`aggregate.field = value`) from services. Services call methods; methods enforce invariants and update internal state. Field access for reads is fine.
+- `[ours]` **Mutation methods are verb-named after the domain event they conceptually represent.** `adopt_baseline(filename, hash)` not `update_baseline(...)`. `mark_installed(path)` not `set_installed(...)`. `promote_slot(slot, source)` not `update_slot_source(...)`. Why: intent-revealing names encode what *happened*, not which fields changed; the method name becomes the implicit event name (`BaselineAdopted`, `Installed`, `SlotPromoted`) if/when chapter 8+ events get added in a follow-up epic. Free refactor seam, zero cost now.
+- `[ours]` Chapter 8+ (domain events + message bus) is explicitly **out of scope** for the current SQLite epic. Trigger for revisiting: handler diversity ≥3 kinds for the same aggregate state change, OR a non-Steam consumer (CLI/web/etc.) becomes concrete, OR a telemetry/analytics layer needs to subscribe.
 
 **Bootstrap (`bootstrap.py`)**: `[CP]` The composition root — the only place where concrete adapters meet services. (Canonical CP composition root.)
 
