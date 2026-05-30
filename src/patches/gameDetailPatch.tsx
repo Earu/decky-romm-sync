@@ -21,6 +21,7 @@ import { RomMPlaySection } from "../components/RomMPlaySection";
 import { RomMGameInfoPanel } from "../components/RomMGameInfoPanel";
 import { debugLog } from "../api/backend";
 import type { RoutePatch } from "@decky/api";
+import { detach } from "../utils/detach";
 
 // Cached set of RomM app IDs — updated by registerRomMAppId
 const rommAppIds = new Set<number>();
@@ -67,7 +68,7 @@ function deepTreeDump(node: any, depth: number, index: number, prefix: string): 
     childCount = 1;
   }
 
-  debugLog(`${prefix}${indent}[${depth}:${index}] type=${typeName} key=${key} cls=${className} children=${childCount}`);
+  detach(debugLog(`${prefix}${indent}[${depth}:${index}] type=${typeName} key=${key} cls=${className} children=${childCount}`));
 
   // Recurse into children
   if (Array.isArray(childrenRaw)) {
@@ -120,40 +121,40 @@ function dumpTree(container: any, appId: number): void {
   if (!rommAppIds.has(appId) || treeDumped) return;
   treeDumped = true;
 
-  debugLog(`===== DEEP TREE DUMP for appId=${appId} =====`);
-  debugLog(`InnerContainer className: ${container.props.className}`);
+  detach(debugLog(`===== DEEP TREE DUMP for appId=${appId} =====`));
+  detach(debugLog(`InnerContainer className: ${container.props.className}`));
 
   const children = container.props.children;
-  debugLog(`InnerContainer direct children count: ${children.length}`);
+  detach(debugLog(`InnerContainer direct children count: ${children.length}`));
   for (let i = 0; i < children.length; i++) {
     deepTreeDump(children[i], 0, i, "TREE: ");
   }
 
   // Search for playSectionClasses.Container deep in tree
   const psContainerClass = playSectionClasses?.Container;
-  debugLog(`playSectionClasses.Container = "${psContainerClass || "UNDEFINED"}"`);
+  detach(debugLog(`playSectionClasses.Container = "${psContainerClass || "UNDEFINED"}"`));
   if (psContainerClass) {
     const psFound = findInReactTree(
       container,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Steam internal React tree; runtime shape is dynamic, no upstream types ship
       (x: any) => x?.props?.className?.includes?.(psContainerClass),
     );
-    debugLog(`findInReactTree(playSectionClasses.Container): ${psFound ? "FOUND" : "NOT FOUND"}`);
+    detach(debugLog(`findInReactTree(playSectionClasses.Container): ${psFound ? "FOUND" : "NOT FOUND"}`));
   }
 
   // Search for basicAppDetailsSectionStylerClasses.PlaySection deep in tree
   const bpsClass = basicAppDetailsSectionStylerClasses?.PlaySection;
-  debugLog(`basicAppDetailsSectionStylerClasses.PlaySection = "${bpsClass || "UNDEFINED"}"`);
+  detach(debugLog(`basicAppDetailsSectionStylerClasses.PlaySection = "${bpsClass || "UNDEFINED"}"`));
   if (bpsClass) {
     const bpsFound = findInReactTree(
       container,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Steam internal React tree; runtime shape is dynamic, no upstream types ship
       (x: any) => x?.props?.className?.includes?.(bpsClass),
     );
-    debugLog(`findInReactTree(basicAppDetailsSectionStylerClasses.PlaySection): ${bpsFound ? "FOUND" : "NOT FOUND"}`);
+    detach(debugLog(`findInReactTree(basicAppDetailsSectionStylerClasses.PlaySection): ${bpsFound ? "FOUND" : "NOT FOUND"}`));
   }
 
-  debugLog(`===== END DEEP TREE DUMP =====`);
+  detach(debugLog(`===== END DEEP TREE DUMP =====`));
 }
 
 export function registerRomMAppId(appId: number) {
@@ -207,7 +208,7 @@ export function registerGameDetailPatch() {
 
             // Only apply RomM modifications for RomM shortcuts
             const isRomM = rommAppIds.has(appId);
-            debugLog(`gameDetailPatch: appId=${appId} isRomM=${isRomM} setSize=${rommAppIds.size}`);
+            detach(debugLog(`gameDetailPatch: appId=${appId} isRomM=${isRomM} setSize=${rommAppIds.size}`));
 
             dumpTree(container, appId);
 
@@ -245,10 +246,10 @@ export function registerGameDetailPatch() {
                 }, rommPlaySection, rommInfoPanel);
 
                 if (nativeOverviewIdx >= 0) {
-                  debugLog(`gameDetailPatch: replacing AppDetailsOverviewPanel at index ${nativeOverviewIdx} with RomM wrapper (cls=${appDetailsClasses?.AppDetailsOverviewPanel})`);
+                  detach(debugLog(`gameDetailPatch: replacing AppDetailsOverviewPanel at index ${nativeOverviewIdx} with RomM wrapper (cls=${appDetailsClasses?.AppDetailsOverviewPanel})`));
                   children.splice(nativeOverviewIdx, 1, rommWrapper);
                 } else {
-                  debugLog(`gameDetailPatch: AppDetailsOverviewPanel not found, inserting RomM wrapper at index 1`);
+                  detach(debugLog(`gameDetailPatch: AppDetailsOverviewPanel not found, inserting RomM wrapper at index 1`));
                   children.splice(1, 0, rommWrapper);
                 }
               }
