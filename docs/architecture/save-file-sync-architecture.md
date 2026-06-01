@@ -560,13 +560,13 @@ If the RomM server is unreachable when a sync runs:
 
 ### Local delta-based accumulation
 
-Playtime is tracked per-ROM in `save_sync_state.json` under `playtime.<rom_id>` (a separate top-level section from `saves`).
+Playtime is tracked per-ROM in the SQLite `rom_playtime` table (the `Playtime` aggregate), independent of the `saves` lifecycle. (The legacy `save_sync_state.json` `playtime.<rom_id>` section is no longer written by `PlaytimeService` and no longer read by anyone — uninstalling a ROM now deletes only its files and `rom_installs` row, leaving playtime and saves intact per [ADR-0007](../adr/0007-rom-retention-identity-anchor.md). The dormant JSON section is dropped in the JSON-state teardown stream.)
 
 Session tracking:
 
-1. `recordSessionStart(romId)`: backend notes the start timestamp in `playtime.<rom_id>.last_session_start`
+1. `recordSessionStart(romId)`: backend opens the session marker (`last_session_start`) on the ROM's `rom_playtime` row in a short write Unit of Work
 2. During play, device suspend/resume events pause the timer (via `RegisterForOnSuspendRequest` / `RegisterForOnResumeFromSuspend`)
-3. `recordSessionEnd(romId)`: backend calculates elapsed time (clamped to 0–24h), increments `total_seconds` and `session_count`, records `last_session_duration_sec`, then syncs to RomM via user notes
+3. `recordSessionEnd(romId)`: in an executor worker, a short write UoW folds the closed session into the aggregate (`record_session` clamps elapsed to 0–24h, increments `total_seconds` and `session_count`, records `last_session_duration_sec`); then, outside the transaction, the merged total is pushed to RomM via user notes (best-effort)
 
 ### Steam display
 
@@ -646,7 +646,7 @@ The save-sync **feature toggles** (`save_sync_enabled`, `sync_before_launch`, `s
 | `saves.<id>.files.<fn>.last_sync_server_size` | integer | Server file size at last sync. |
 | `saves.<id>.files.<fn>.last_sync_local_mtime` | float | Local file mtime (epoch seconds) at last sync. |
 | `saves.<id>.files.<fn>.last_sync_local_size` | integer | Local file size (bytes) at last sync. |
-| `playtime` | object | Per-ROM playtime tracking, keyed by `rom_id` (string). Separate from `saves`. |
+| `playtime` | object | **Legacy / dormant — no live reader.** Per-ROM playtime now lives in the SQLite `rom_playtime` table (the `Playtime` aggregate); `PlaytimeService` no longer writes this JSON section and `RomRemovalService` no longer reads it (uninstall keeps playtime per [ADR-0007](../adr/0007-rom-retention-identity-anchor.md)). It is dropped in the JSON-state teardown stream. The same fields below (`total_seconds`, `session_count`, `last_session_start`, `last_session_duration_sec`, `note_id`) back the SQLite aggregate. |
 | `playtime.<id>.total_seconds` | integer | Accumulated playtime in seconds. |
 | `playtime.<id>.session_count` | integer | Number of completed play sessions. |
 | `playtime.<id>.last_session_start` | ISO-8601 / null | Start time of current session (null when not playing). |
@@ -667,6 +667,10 @@ Conflicts are no longer persisted. They are returned ephemerally from `_sync_rom
 
 The dropped `pending_conflicts`, `dismissed_saves_state`, and other obsolete sync-state fields are simply not loaded. They never appear in the rebuilt aggregate, and the next state write produces a clean file.
 
+### SaveSyncState SQLite cutover status
+
+The game-detail panel's cached has-saves badge (`get_cached_game_detail`) no longer reads the in-memory `SaveSyncState.saves` dict — it reads the `rom_save_states` aggregate through the Unit of Work (the per-file `last_sync_hash` → the `synced`/`unknown` status the badge renders), the lightweight counterpart to the live `getSaveStatus` flow above. With that and the playtime cutover, the legacy `SaveSyncState` container has **no live reader** and is fully dead pending teardown; the live save-sync engine still persists through `save_sync_state.json` (the SaveService SQLite migration is a separate cutover stream). `domain/save_state.py` is removed in the teardown stream, not here.
+
 ## Session Detection
 
 Game start and stop events are detected using Steam's frontend APIs, not by polling emulator processes.
@@ -686,7 +690,7 @@ After a game starts, there is a brief window where the app ID may not be fully r
 
 ### App ID to ROM ID mapping
 
-The session manager maintains a cached `appId -> romId` map loaded from the backend shortcut registry. This map is refreshed:
+The session manager maintains a cached `appId -> romId` map loaded from the backend's synced-ROM registry (the `roms` SQLite table, via `get_app_id_rom_id_map`). This map is refreshed:
 
 - On session manager initialization (plugin load)
 - Before each game start event (in case a sync added new shortcuts)
@@ -733,7 +737,7 @@ The plugin stores playtime data in RomM notes (since RomM has no dedicated playt
 3. **Update**: `PUT /api/roms/{id}/notes/{note_id}` with updated playtime JSON
 4. **Delete**: `DELETE /api/roms/{id}/notes/{note_id}` if needed
 
-The note `id` is cached locally in `save_sync_state.json` to avoid fetching the full ROM detail on every session end. If the local state file is lost, the plugin recovers by reading `all_user_notes` from the ROM detail and finding existing notes by `title == "romm-sync:playtime"`.
+The note `id` is cached locally on the `rom_playtime` row (`note_id`) to avoid fetching the full ROM detail on every session end. If the local row is lost, the plugin recovers by reading `all_user_notes` from the ROM detail and finding existing notes by `title == "romm-sync:playtime"`.
 
 ### Future: RomM playtime API
 

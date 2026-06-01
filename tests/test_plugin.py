@@ -4,19 +4,16 @@ import os
 from unittest.mock import MagicMock
 
 import pytest
-from fakes.fake_metadata_cache_persister import FakeMetadataCachePersister
 from fakes.fake_path_exists_reader import FakePathExistsReader
 from fakes.fake_retrodeck_paths import FakeRetroDeckPaths
 from fakes.fake_settings_persister import FakeSettingsPersister
 from fakes.fake_sgdb_artwork_cache import FakeSgdbArtworkCache
-from fakes.fake_state_persister import FakeStatePersister
-from fakes.library_peers import FakeArtworkManager, FakeMetadataExtractor
+from fakes.fake_unit_of_work import FakeUnitOfWorkFactory
+from fakes.library_peers import FakeArtworkManager
 from fakes.system_time import FakeClock, FakeSleeper, FakeUuidGen
-from models.state import make_default_plugin_state
 
 from adapters.debug_logger import SettingsAwareDebugLogger
 from adapters.persistence import PersistenceAdapter, SettingsPersisterAdapter
-from adapters.registry_store import RegistryStoreAdapter
 from adapters.steam_config import SteamConfigAdapter
 
 # conftest.py patches decky before this import
@@ -34,8 +31,6 @@ def plugin():
     p.settings = {"romm_url": "", "romm_user": "", "romm_pass": "", "enabled_platforms": {}}
     p._http_adapter = MagicMock()
     p._romm_api = MagicMock()
-    p._state = make_default_plugin_state()
-    p._metadata_cache = {}
     # Default to "/tmp" so the prune guard sees an existing home in tests that
     # don't override it. Tests exercising the guard rebuild this with a
     # non-existent path or empty string.
@@ -51,18 +46,13 @@ def plugin():
     steam_config = SteamConfigAdapter(user_home=decky.DECKY_USER_HOME, logger=decky.logger)
     p._steam_config = steam_config
 
-    p._state_persister = FakeStatePersister()
     p._settings_persister = FakeSettingsPersister()
-    p._metadata_cache_persister = FakeMetadataCachePersister()
-    p._registry_store = RegistryStoreAdapter(state=p._state, logger=decky.logger)
 
     p._sync_service = LibraryService(
         config=LibraryServiceConfig(
             romm_api=p._romm_api,
             steam_config=steam_config,
-            state=p._state,
             settings=p.settings,
-            metadata_cache=p._metadata_cache,
             loop=asyncio.get_event_loop(),
             logger=decky.logger,
             plugin_dir=decky.DECKY_PLUGIN_DIR,
@@ -70,12 +60,10 @@ def plugin():
             clock=FakeClock(),
             uuid_gen=FakeUuidGen(),
             sleeper=FakeSleeper(),
-            state_persister=p._state_persister,
             settings_persister=p._settings_persister,
-            registry_store=p._registry_store,
             log_debug=p._log_debug,
-            metadata_service=FakeMetadataExtractor(),
             artwork=FakeArtworkManager(),
+            uow_factory=FakeUnitOfWorkFactory(),
         ),
     )
 
@@ -85,22 +73,20 @@ def plugin():
             romm_api=p._romm_api,
             steam_config=steam_config,
             sgdb_artwork_cache=FakeSgdbArtworkCache(cache_root=decky.DECKY_PLUGIN_RUNTIME_DIR),
-            state=p._state,
             settings=p.settings,
             loop=asyncio.get_event_loop(),
             logger=decky.logger,
-            state_persister=FakeStatePersister(),
             settings_persister=FakeSettingsPersister(),
-            registry_store=p._registry_store,
             get_pending_sync=lambda: p._sync_service._pending_sync,
             log_debug=p._log_debug,
+            uow_factory=FakeUnitOfWorkFactory(),
         ),
     )
 
     p._settings_service = SettingsService(
         config=SettingsServiceConfig(
             settings=p.settings,
-            state=p._state,
+            uow_factory=FakeUnitOfWorkFactory(),
             logger=decky.logger,
             settings_persister=p._settings_persister,
             steam_config=steam_config,
@@ -119,12 +105,11 @@ def plugin():
 
     p._startup_healing_service = StartupHealingService(
         config=StartupHealingServiceConfig(
-            state=p._state,
             logger=decky.logger,
-            state_persister=p._state_persister,
-            registry_store=p._registry_store,
+            clock=FakeClock(),
             retrodeck_paths=p._retrodeck_paths,
             path_probe=FakePathExistsReader(),
+            uow_factory=FakeUnitOfWorkFactory(),
         ),
     )
     return p
@@ -147,15 +132,6 @@ class TestPersistenceAttributeIsLoud:
         with pytest.raises(AttributeError, match="_persistence"):
             _ = bare._persistence
 
-    def test_state_persister_missing_on_bare_plugin(self):
-        """``_state_persister`` is bound only by ``_main()``; bare access raises."""
-        from main import Plugin
-
-        bare = Plugin()
-
-        with pytest.raises(AttributeError, match="_state_persister"):
-            _ = bare._state_persister
-
     def test_settings_persister_missing_on_bare_plugin(self):
         """``_settings_persister`` is bound only by ``_main()``; bare access raises."""
         from main import Plugin
@@ -164,15 +140,6 @@ class TestPersistenceAttributeIsLoud:
 
         with pytest.raises(AttributeError, match="_settings_persister"):
             _ = bare._settings_persister
-
-    def test_metadata_cache_persister_missing_on_bare_plugin(self):
-        """``_metadata_cache_persister`` is bound only by ``_main()``; bare access raises."""
-        from main import Plugin
-
-        bare = Plugin()
-
-        with pytest.raises(AttributeError, match="_metadata_cache_persister"):
-            _ = bare._metadata_cache_persister
 
 
 class TestSettings:
@@ -430,7 +397,6 @@ class TestLogLevel:
 
         plugin.settings["log_level"] = "debug"
         plugin.settings["steamgriddb_api_key"] = ""
-        plugin._state["shortcut_registry"]["1"] = {"sgdb_id": None, "igdb_id": None}
         with patch.object(decky.logger, "info") as mock_info:
             result = await plugin.get_sgdb_artwork_base64(1, 1)
             assert result["no_api_key"] is True
@@ -841,9 +807,6 @@ class TestMainStartupOrdering:
         migration_service.detect_save_sort_change = MagicMock()
 
         save_sync_service = MagicMock()
-        save_sync_service.init_state = MagicMock()
-        save_sync_service.load_state = MagicMock()
-        save_sync_service.prune_orphaned_state = MagicMock()
 
         sgdb_service = MagicMock()
         sgdb_service.prune_orphaned_artwork_cache = MagicMock()
@@ -861,7 +824,9 @@ class TestMainStartupOrdering:
         startup_healing_service.prune_stale_installed_roms.side_effect = lambda: call_order.append(
             "prune_stale_installed_roms"
         )
-        startup_healing_service.prune_stale_registry.side_effect = lambda: call_order.append("prune_stale_registry")
+        startup_healing_service.reconcile_orphaned_sync_runs.side_effect = lambda: call_order.append(
+            "reconcile_orphaned_sync_runs"
+        )
 
         wired_services = {
             "save_sync_service": save_sync_service,
@@ -903,22 +868,14 @@ class TestMainStartupOrdering:
                 core_info_provider=MagicMock(),
             ),
             stores=StateBundle(
-                state=make_default_plugin_state(),
                 settings={},
-                metadata_cache={},
-                save_sync_state=MagicMock(),
             ),
             callbacks=CallbackBundle(
                 retrodeck_paths=MagicMock(),
                 get_retroarch_save_sorting=MagicMock(),
                 get_core_name=MagicMock(),
-                state_persister=MagicMock(),
                 settings_persister=MagicMock(),
-                metadata_cache_persister=MagicMock(),
                 firmware_cache_persister=MagicMock(),
-                save_sync_state_persister=MagicMock(),
-                registry_store=MagicMock(),
-                metadata_store=MagicMock(),
                 log_debug=MagicMock(),
                 plugin_metadata=MagicMock(),
                 uow_factory=MagicMock(),

@@ -15,9 +15,6 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import cast
-
-from models.state import MetadataCache, PluginState, make_default_plugin_state
 
 from adapters.asyncio_sleeper import AsyncioSleeper
 from adapters.cover_art_file_store import CoverArtFileStoreAdapter
@@ -26,19 +23,14 @@ from adapters.download_file import DownloadFileAdapter
 from adapters.es_de_config import CoreResolver, GamelistXmlEditorAdapter
 from adapters.firmware_file import FirmwareFileAdapter
 from adapters.hostname import HostnameAdapter
-from adapters.metadata_cache_store import MetadataCacheStoreAdapter
 from adapters.migration_file import MigrationFileAdapter
 from adapters.path_probe import PathProbeAdapter
 from adapters.persistence import (
     FirmwareCachePersisterAdapter,
-    MetadataCachePersisterAdapter,
     PersistenceAdapter,
-    SaveSyncStatePersisterAdapter,
     SettingsPersisterAdapter,
-    StatePersisterAdapter,
 )
 from adapters.plugin_metadata import PluginMetadataAdapter
-from adapters.registry_store import RegistryStoreAdapter
 from adapters.repositories.unit_of_work import SqliteUnitOfWork
 from adapters.retroarch_config import RetroArchConfigAdapter
 from adapters.retroarch_core_info import RetroArchCoreInfoAdapter
@@ -53,8 +45,7 @@ from adapters.steam_config import SteamConfigAdapter
 from adapters.steamgriddb import SteamGridDbAdapter
 from adapters.system_clock import SystemClock
 from adapters.system_uuid_gen import SystemUuidGen
-from domain.save_state import SaveSyncState
-from domain.state_migrations import fold_legacy_save_sync_settings, migrate_settings, migrate_state
+from domain.state_migrations import fold_legacy_save_sync_settings, migrate_settings
 from lib.late_binding import LateBinding
 from services.achievements import AchievementsService, AchievementsServiceConfig
 from services.artwork import ArtworkService, ArtworkServiceConfig
@@ -80,8 +71,6 @@ from services.protocols import (
     FirmwareFileStore,
     GamelistXmlEditor,
     HostnameReader,
-    MetadataCachePersister,
-    MetadataCacheStore,
     MigrationFileStore,
     PathExistsReader,
     PluginMetadataReader,
@@ -90,12 +79,9 @@ from services.protocols import (
     RomFileStore,
     RommApi,
     SaveFileStore,
-    SaveSyncStatePersister,
     SettingsPersister,
     SgdbArtworkCache,
-    ShortcutRegistryStore,
     Sleeper,
-    StatePersister,
     SteamConfigStore,
     UnitOfWorkFactory,
     UuidGen,
@@ -111,18 +97,6 @@ from services.steamgrid import SteamGridService, SteamGridServiceConfig
 # Filename of the SQLite database inside the plugin runtime dir. Created by the
 # migration runner at startup; unused until the service cutover (#784).
 _DB_FILENAME = "romm_sync.db"
-
-
-def _default_state() -> PluginState:
-    """Fresh default ``state`` dict for first-run persistence.
-
-    Delegates to :func:`models.state.make_default_plugin_state` so the
-    canonical shape lives next to the :class:`PluginState` schema. Wrapped
-    here (rather than re-exported) to preserve the module-level factory
-    indirection — callers always receive independent inner containers
-    even if the underlying default ever changes.
-    """
-    return make_default_plugin_state()
 
 
 @dataclass(frozen=True)
@@ -147,12 +121,9 @@ class AdapterBundle:
 
 @dataclass(frozen=True)
 class StateBundle:
-    """Live mutable state stores shared across services."""
+    """Live mutable state shared across services."""
 
-    state: PluginState
     settings: dict
-    metadata_cache: MetadataCache
-    save_sync_state: SaveSyncState
 
 
 @dataclass(frozen=True)
@@ -177,13 +148,8 @@ class CallbackBundle:
     retrodeck_paths: RetroDeckPaths
     get_retroarch_save_sorting: RetroArchSaveSortingProvider
     get_core_name: CoreNameProviderFn
-    state_persister: StatePersister
     settings_persister: SettingsPersister
-    metadata_cache_persister: MetadataCachePersister
     firmware_cache_persister: FirmwareCachePersister
-    save_sync_state_persister: SaveSyncStatePersister
-    registry_store: ShortcutRegistryStore
-    metadata_store: MetadataCacheStore
     log_debug: DebugLogger
     plugin_metadata: PluginMetadataReader
     uow_factory: UnitOfWorkFactory
@@ -266,13 +232,10 @@ def bootstrap(
     """Build every adapter and bundle the composition root hands to ``main.py``.
 
     Bootstrap owns adapter instantiation and is the only path that
-    constructs ``PersistenceAdapter``. Settings, plugin state, and the
-    metadata cache are loaded + migrated inside here so the three
-    domain-specific persister adapters (``StatePersisterAdapter`` /
-    ``SettingsPersisterAdapter`` / ``MetadataCachePersisterAdapter``)
-    bind the live dicts at construction; mutating any of those dicts
-    from the caller side is visible to every adapter/service that
-    holds the same reference.
+    constructs ``PersistenceAdapter``. Settings are loaded + migrated
+    inside here so the ``SettingsPersisterAdapter`` binds the live dict
+    at construction; mutating that dict from the caller side is visible
+    to every adapter/service that holds the same reference.
 
     Parameters
     ----------
@@ -295,14 +258,17 @@ def bootstrap(
         handles ``main.py`` itself binds (``handles.debug_logger``).
     """
     # Bring the on-disk SQLite schema up to date before any service is wired —
-    # the composition root owns startup infra. Pre-cutover (#784) nothing reads
-    # romm_sync.db, so creating the schema now is harmless; a failed migration
-    # is logged but not fatal (cutover-aware fatal/non-fatal handling is #784).
+    # the composition root owns startup infra. Post-cutover (#784) SQLite is the
+    # sole persistence backend: there is no JSON fallback, so a failed or
+    # unopenable database is fatal. Log the cause, then re-raise so bootstrap
+    # aborts and the plugin stays inert — matching the RomM-minimum-version
+    # gate's "inert until the environment is fixed" posture.
     db_path = os.path.join(runtime_dir, _DB_FILENAME)
     try:
         apply_migrations(db_path, MIGRATIONS_DIR, logger=logger)
     except Exception:
-        logger.exception("SQLite schema migration failed; database left at last good version")
+        logger.exception("SQLite schema migration failed; plugin cannot start")
+        raise
 
     # The runtime Unit-of-Work factory: each call opens a fresh sync sqlite3
     # connection on db_path (ADR-0004). Wired here but not yet threaded into any
@@ -321,7 +287,6 @@ def bootstrap(
 
     persistence = PersistenceAdapter(settings_dir, runtime_dir, logger)
     firmware_cache_persister = FirmwareCachePersisterAdapter(persistence)
-    save_sync_state_persister = SaveSyncStatePersisterAdapter(persistence)
     settings = persistence.load_settings()
     # One-time JSON→JSON lift (ADR-0003): fold the legacy save-sync knobs +
     # device_name out of save_sync_state.json before the schema bump stamps
@@ -331,19 +296,7 @@ def bootstrap(
         settings = fold_legacy_save_sync_settings(settings, persistence.load_save_sync_state())
     settings = migrate_settings(settings)
     persistence.save_settings(settings)
-    # Persistence + migration round-trip through bare ``dict`` because
-    # ``load_state`` / ``migrate_state`` / ``load_metadata_cache`` predate the
-    # TypedDicts and operate on the on-disk JSON shape. Cast down to ``dict``
-    # at the boundary, cast up to ``PluginState`` / ``MetadataCache`` once the
-    # shape is in hand so the rest of bootstrap sees the typed dict.
-    state = cast("PluginState", persistence.load_state(cast("dict", _default_state())))
-    state = cast("PluginState", migrate_state(cast("dict", state)))
-    metadata_cache = cast("MetadataCache", persistence.load_metadata_cache())
-    state_persister = StatePersisterAdapter(persistence, state)
     settings_persister = SettingsPersisterAdapter(persistence, settings)
-    metadata_cache_persister = MetadataCachePersisterAdapter(persistence, metadata_cache)
-    registry_store = RegistryStoreAdapter(state=state, logger=logger)
-    metadata_store = MetadataCacheStoreAdapter(metadata_cache=metadata_cache)
     plugin_metadata = PluginMetadataAdapter()
     # Single source of truth for outgoing User-Agent — read package.json
     # version once at boot and thread the string to every HTTP-talking
@@ -367,7 +320,6 @@ def bootstrap(
     sleeper = AsyncioSleeper()
     hostname_provider = HostnameAdapter()
     debug_logger = SettingsAwareDebugLogger(settings=settings, logger=logger)
-    save_sync_state = SaveService.make_default_state()
 
     adapters = AdapterBundle(
         http_adapter=http_adapter,
@@ -386,22 +338,14 @@ def bootstrap(
         core_info_provider=core_resolver,
     )
     stores = StateBundle(
-        state=state,
         settings=settings,
-        metadata_cache=metadata_cache,
-        save_sync_state=save_sync_state,
     )
     callbacks = CallbackBundle(
         retrodeck_paths=retrodeck_paths,
         get_retroarch_save_sorting=retroarch_config.get_retroarch_save_sorting,
         get_core_name=retroarch_core_info.get_corename,
-        state_persister=state_persister,
         settings_persister=settings_persister,
-        metadata_cache_persister=metadata_cache_persister,
         firmware_cache_persister=firmware_cache_persister,
-        save_sync_state_persister=save_sync_state_persister,
-        registry_store=registry_store,
-        metadata_store=metadata_store,
         log_debug=debug_logger,
         plugin_metadata=plugin_metadata,
         uow_factory=uow_factory,
@@ -450,11 +394,9 @@ def wire_services(cfg: WiringConfig) -> dict:
     migration_service = MigrationService(
         config=MigrationServiceConfig(
             migration_file_store=cfg.adapters.migration_file_store,
-            state=cfg.stores.state,
             settings=cfg.stores.settings,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
-            state_persister=cfg.callbacks.state_persister,
             settings_persister=cfg.callbacks.settings_persister,
             emit=cfg.runtime.emit,
             get_bios_files_index=bios_files_index_binding.get,
@@ -462,6 +404,7 @@ def wire_services(cfg: WiringConfig) -> dict:
             get_retroarch_save_sorting=cfg.callbacks.get_retroarch_save_sorting,
             get_active_core=cfg.adapters.core_info_provider.get_active_core,
             get_core_name=cfg.callbacks.get_core_name,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
@@ -469,9 +412,6 @@ def wire_services(cfg: WiringConfig) -> dict:
         romm_api=cfg.adapters.romm_api,
         retry=cfg.adapters.http_adapter,
         settings=cfg.stores.settings,
-        state=cfg.stores.state,
-        save_sync_state=cfg.stores.save_sync_state,
-        save_sync_state_persister=cfg.callbacks.save_sync_state_persister,
         settings_persister=cfg.callbacks.settings_persister,
         save_file_store=cfg.adapters.save_file_store,
         loop=cfg.runtime.loop,
@@ -488,6 +428,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         # SaveService must observe fresh sort state before computing saves_dir (#238).
         detect_sort_change=migration_service.detect_save_sort_change,
         is_retrodeck_migration_pending=migration_service.is_retrodeck_migration_pending,
+        uow_factory=cfg.callbacks.uow_factory,
     )
     save_sync_service = SaveService(config=save_service_config)
 
@@ -495,26 +436,21 @@ def wire_services(cfg: WiringConfig) -> dict:
         config=PlaytimeServiceConfig(
             romm_api=cfg.adapters.romm_api,
             retry=cfg.adapters.http_adapter,
-            save_sync_state=cfg.stores.save_sync_state,
             settings=cfg.stores.settings,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
             clock=cfg.runtime.clock,
-            state_persister=save_sync_service,
             log_debug=cfg.callbacks.log_debug,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
     metadata_service = MetadataService(
         config=MetadataServiceConfig(
-            state=cfg.stores.state,
-            metadata_cache=cfg.stores.metadata_cache,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
-            clock=cfg.runtime.clock,
-            metadata_cache_persister=cfg.callbacks.metadata_cache_persister,
-            metadata_store=cfg.callbacks.metadata_store,
             log_debug=cfg.callbacks.log_debug,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
@@ -523,26 +459,20 @@ def wire_services(cfg: WiringConfig) -> dict:
             romm_api=cfg.adapters.romm_api,
             steam_config=cfg.adapters.steam_config,
             cover_art_file_store=cfg.adapters.cover_art_file_store,
-            state=cfg.stores.state,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
             get_pending_sync=pending_sync_binding.get,
-            registry_store=cfg.callbacks.registry_store,
-            state_persister=cfg.callbacks.state_persister,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
     shortcut_removal_service = ShortcutRemovalService(
         config=ShortcutRemovalServiceConfig(
-            romm_api=cfg.adapters.romm_api,
             steam_config=cfg.adapters.steam_config,
-            state=cfg.stores.state,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
-            emit=cfg.runtime.emit,
-            state_persister=cfg.callbacks.state_persister,
-            registry_store=cfg.callbacks.registry_store,
             artwork_remover=artwork_service,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
@@ -550,9 +480,7 @@ def wire_services(cfg: WiringConfig) -> dict:
         config=LibraryServiceConfig(
             romm_api=cfg.adapters.romm_api,
             steam_config=cfg.adapters.steam_config,
-            state=cfg.stores.state,
             settings=cfg.stores.settings,
-            metadata_cache=cfg.stores.metadata_cache,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
             plugin_dir=cfg.runtime.plugin_dir,
@@ -560,12 +488,10 @@ def wire_services(cfg: WiringConfig) -> dict:
             clock=cfg.runtime.clock,
             uuid_gen=cfg.runtime.uuid_gen,
             sleeper=cfg.runtime.sleeper,
-            state_persister=cfg.callbacks.state_persister,
             settings_persister=cfg.callbacks.settings_persister,
-            registry_store=cfg.callbacks.registry_store,
             log_debug=cfg.callbacks.log_debug,
-            metadata_service=metadata_service,
             artwork=artwork_service,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
     pending_sync_binding.set(lambda: sync_service.pending_sync)
@@ -573,7 +499,6 @@ def wire_services(cfg: WiringConfig) -> dict:
     download_service = DownloadService(
         config=DownloadServiceConfig(
             romm_api=cfg.adapters.romm_api,
-            state=cfg.stores.state,
             download_file_store=cfg.adapters.download_file_store,
             resolve_system=cfg.adapters.http_adapter.resolve_system,
             loop=cfg.runtime.loop,
@@ -581,38 +506,33 @@ def wire_services(cfg: WiringConfig) -> dict:
             emit=cfg.runtime.emit,
             clock=cfg.runtime.clock,
             sleeper=cfg.runtime.sleeper,
-            state_persister=cfg.callbacks.state_persister,
             retrodeck_paths=cfg.callbacks.retrodeck_paths,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
     rom_removal_service = RomRemovalService(
         config=RomRemovalServiceConfig(
-            state=cfg.stores.state,
-            save_sync_state=cfg.stores.save_sync_state,
             logger=cfg.runtime.logger,
             loop=cfg.runtime.loop,
-            state_persister=cfg.callbacks.state_persister,
-            save_sync_state_writer=save_sync_service,
             rom_file_store=cfg.adapters.rom_file_store,
             retrodeck_paths=cfg.callbacks.retrodeck_paths,
             download_queue_cleanup=download_service,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
     firmware_service = FirmwareService(
         config=FirmwareServiceConfig(
             romm_api=cfg.adapters.romm_api,
-            state=cfg.stores.state,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
             plugin_dir=cfg.runtime.plugin_dir,
             clock=cfg.runtime.clock,
-            state_persister=cfg.callbacks.state_persister,
-            firmware_cache_persister=cfg.callbacks.firmware_cache_persister,
             firmware_file_store=cfg.adapters.firmware_file_store,
             retrodeck_paths=cfg.callbacks.retrodeck_paths,
             core_info=cfg.adapters.core_info_provider,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
     # Load the BIOS registry from disk now so the property does not raise
@@ -626,22 +546,20 @@ def wire_services(cfg: WiringConfig) -> dict:
             romm_api=cfg.adapters.romm_api,
             steam_config=cfg.adapters.steam_config,
             sgdb_artwork_cache=cfg.adapters.sgdb_artwork_cache,
-            state=cfg.stores.state,
             settings=cfg.stores.settings,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
-            state_persister=cfg.callbacks.state_persister,
             settings_persister=cfg.callbacks.settings_persister,
-            registry_store=cfg.callbacks.registry_store,
             get_pending_sync=pending_sync_binding.get,
             log_debug=cfg.callbacks.log_debug,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 
     achievements_service = AchievementsService(
         config=AchievementsServiceConfig(
             romm_api=cfg.adapters.romm_api,
-            state=cfg.stores.state,
+            uow_factory=cfg.callbacks.uow_factory,
             loop=cfg.runtime.loop,
             logger=cfg.runtime.logger,
             clock=cfg.runtime.clock,
@@ -651,12 +569,10 @@ def wire_services(cfg: WiringConfig) -> dict:
 
     game_detail_service = GameDetailService(
         config=GameDetailServiceConfig(
-            state=cfg.stores.state,
-            metadata_cache=cfg.stores.metadata_cache,
-            save_sync_state=cfg.stores.save_sync_state,
             settings=cfg.stores.settings,
             logger=cfg.runtime.logger,
             clock=cfg.runtime.clock,
+            uow_factory=cfg.callbacks.uow_factory,
             bios_checker=firmware_service,
             achievements=achievements_service,
         ),
@@ -665,7 +581,7 @@ def wire_services(cfg: WiringConfig) -> dict:
     settings_service = SettingsService(
         config=SettingsServiceConfig(
             settings=cfg.stores.settings,
-            state=cfg.stores.state,
+            uow_factory=cfg.callbacks.uow_factory,
             logger=cfg.runtime.logger,
             settings_persister=cfg.callbacks.settings_persister,
             steam_config=cfg.adapters.steam_config,
@@ -695,12 +611,11 @@ def wire_services(cfg: WiringConfig) -> dict:
 
     startup_healing_service = StartupHealingService(
         config=StartupHealingServiceConfig(
-            state=cfg.stores.state,
             logger=cfg.runtime.logger,
-            state_persister=cfg.callbacks.state_persister,
-            registry_store=cfg.callbacks.registry_store,
+            clock=cfg.runtime.clock,
             retrodeck_paths=cfg.callbacks.retrodeck_paths,
             path_probe=cfg.adapters.path_probe,
+            uow_factory=cfg.callbacks.uow_factory,
         ),
     )
 

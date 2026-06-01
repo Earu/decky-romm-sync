@@ -10,10 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from models.state import PluginState
-
-from domain.save_state import SaveSyncState
-
 if TYPE_CHECKING:
     import asyncio
     import logging
@@ -32,8 +28,8 @@ if TYPE_CHECKING:
         RommSyncApi,
         SaveFileStore,
         SaveSortChangeFn,
-        SaveSyncStatePersister,
         SettingsPersister,
+        UnitOfWorkFactory,
     )
 
 
@@ -49,24 +45,11 @@ class SaveServiceConfig:
         Retry strategy — provides ``with_retry`` and ``is_retryable``.
     settings:
         Live reference to the main plugin settings dict.
-    state:
-        Live reference to the main plugin state dict (``installed_roms``,
-        ``shortcut_registry``).
-    save_sync_state:
-        Live reference to the typed :class:`SaveSyncState` aggregate.
-        Caller should pre-populate via :meth:`SaveService.load_state`
-        after construction; the aggregate ships with defaults out of
-        the box.
-    save_sync_state_persister:
-        Protocol-typed I/O wrapper for ``save_sync_state.json``. The
-        ``StateService`` uses ``.save(data)`` / ``.load() -> dict | None``
-        — file path, locking, and atomic-write are adapter-internal.
     settings_persister:
-        Protocol-typed zero-arg flush for ``settings.json``. The
-        ``StateService`` calls ``.save_settings()`` after mutating the
-        save-sync feature toggles or the device label in the live
-        ``settings`` dict — those values live in settings.json, not the
-        save-sync aggregate.
+        Protocol-typed zero-arg flush for ``settings.json``. SaveService
+        calls ``.save_settings()`` after mutating the save-sync feature
+        toggles or the device label in the live ``settings`` dict — those
+        values live in settings.json, not the save-sync aggregate.
     save_file_store:
         Protocol-typed filesystem adapter for local save files. Owns the
         raw POSIX, ``open()``, ``tempfile``, and ``hashlib``-on-file
@@ -130,14 +113,17 @@ class SaveServiceConfig:
         ``DebugLogger`` Protocol seam — routes through the user's QAM
         log-level filter. Injected directly into each sub-service that
         needs it; not reached through the ``_save_service`` back-ref.
+    uow_factory:
+        ``UnitOfWorkFactory`` Protocol seam — opens a fresh transactional
+        Unit of Work over the nine SQLite repositories. The saves vertical
+        reads/writes the ``rom_save_states`` aggregate + ``kv_config``
+        device id through it; each public callable owns a narrow
+        read→I/O→write bracket (ADR-0006).
     """
 
     romm_api: RommSyncApi
     retry: RetryStrategy
     settings: dict
-    state: PluginState
-    save_sync_state: SaveSyncState
-    save_sync_state_persister: SaveSyncStatePersister
     settings_persister: SettingsPersister
     save_file_store: SaveFileStore
     loop: asyncio.AbstractEventLoop
@@ -153,3 +139,4 @@ class SaveServiceConfig:
     emit: EventEmitter
     detect_sort_change: SaveSortChangeFn
     is_retrodeck_migration_pending: MigrationPendingFn
+    uow_factory: UnitOfWorkFactory

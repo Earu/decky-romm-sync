@@ -18,8 +18,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from models.state import MetadataCache, PluginState
-
 from lib.late_binding import LateBinding
 from services.library._state import LibrarySyncStateBox
 from services.library.fetcher import LibraryFetcher, LibraryFetcherConfig
@@ -36,13 +34,11 @@ if TYPE_CHECKING:
         Clock,
         DebugLogger,
         EventEmitter,
-        MetadataExtractor,
         RommLibraryApi,
         SettingsPersister,
-        ShortcutRegistryStore,
         Sleeper,
-        StatePersister,
         SteamConfigStore,
+        UnitOfWorkFactory,
         UuidGen,
     )
 
@@ -51,18 +47,18 @@ if TYPE_CHECKING:
 class LibraryServiceConfig:
     """Frozen wiring bundle handed to ``LibraryService.__init__``.
 
-    Holds the Protocol-typed adapters, the live state/settings/metadata
-    cache dicts, runtime infrastructure, time/sleep/uuid seams, plugin-
-    dir reference, event emitter, persistence callbacks, debug-logger
-    seam, and the metadata/artwork peer services LibraryService needs
-    at construction time.
+    Holds the Protocol-typed adapters, the live settings dict, runtime
+    infrastructure, time/sleep/uuid seams, plugin-dir reference, event
+    emitter, the ``settings.json`` persister and the SQLite Unit-of-Work
+    factory (the synced-ROM registry, last-sync timestamp, sync stats and
+    metadata cache now live in ``roms`` / ``sync_runs`` / ``rom_metadata``
+    via the UoW), debug-logger seam, and the artwork peer service
+    LibraryService needs at construction time.
     """
 
     romm_api: RommLibraryApi
     steam_config: SteamConfigStore
-    state: PluginState
     settings: dict
-    metadata_cache: MetadataCache
     loop: asyncio.AbstractEventLoop
     logger: logging.Logger
     plugin_dir: str
@@ -70,12 +66,10 @@ class LibraryServiceConfig:
     clock: Clock
     uuid_gen: UuidGen
     sleeper: Sleeper
-    state_persister: StatePersister
     settings_persister: SettingsPersister
-    registry_store: ShortcutRegistryStore
     log_debug: DebugLogger
-    metadata_service: MetadataExtractor
     artwork: ArtworkManager
+    uow_factory: UnitOfWorkFactory
 
 
 class LibraryService:
@@ -103,14 +97,13 @@ class LibraryService:
         self._fetcher = LibraryFetcher(
             config=LibraryFetcherConfig(
                 romm_api=config.romm_api,
-                state=config.state,
                 settings=config.settings,
-                metadata_cache=config.metadata_cache,
                 loop=config.loop,
                 logger=config.logger,
                 plugin_dir=config.plugin_dir,
                 settings_persister=config.settings_persister,
                 log_debug=config.log_debug,
+                uow_factory=config.uow_factory,
                 sync_state_box=self._box,
                 emit_progress=self._emit_progress_proxy,
             )
@@ -124,7 +117,6 @@ class LibraryService:
         reporter_binding: LateBinding[SyncReporter] = LateBinding("reporter")
         self._orchestrator = SyncOrchestrator(
             config=SyncOrchestratorConfig(
-                state=config.state,
                 settings=config.settings,
                 loop=config.loop,
                 logger=config.logger,
@@ -133,11 +125,10 @@ class LibraryService:
                 clock=config.clock,
                 uuid_gen=config.uuid_gen,
                 sleeper=config.sleeper,
-                state_persister=config.state_persister,
+                uow_factory=config.uow_factory,
                 sync_state_box=self._box,
                 fetcher=self._fetcher,
                 reporter=reporter_binding,
-                metadata_service=config.metadata_service,
                 artwork=config.artwork,
             )
         )
@@ -145,14 +136,12 @@ class LibraryService:
         self._reporter = SyncReporter(
             config=SyncReporterConfig(
                 steam_config=config.steam_config,
-                state=config.state,
                 settings=config.settings,
                 loop=config.loop,
                 logger=config.logger,
                 emit=config.emit,
                 clock=config.clock,
-                state_persister=config.state_persister,
-                registry_store=config.registry_store,
+                uow_factory=config.uow_factory,
                 sync_state_box=self._box,
                 emit_progress=self._emit_progress_proxy,
                 artwork=config.artwork,
@@ -253,16 +242,8 @@ class LibraryService:
         self._box.current_sync_id = value
 
     @property
-    def _state(self) -> PluginState:
-        return self._config.state
-
-    @property
     def _settings(self) -> dict:
         return self._config.settings
-
-    @property
-    def _metadata_cache(self) -> MetadataCache:
-        return self._config.metadata_cache
 
     # ── Public callable surface ──────────────────────────────────
 

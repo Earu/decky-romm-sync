@@ -12,14 +12,22 @@ layout while a migration is in flight.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from models.state import PluginState, SaveSortSettings
+from models.state import SaveSortSettings
 
 from domain.save_extensions import get_save_extensions
 from domain.save_path import resolve_save_dir
+
+# kv_config keys for the cross-run save-sort markers MigrationService writes
+# (ADR-0003 Bucket 2): the last-seen observation and the pending pre-change
+# snapshot. RomInfoService reads them to honour the previous save layout while
+# a save-sort migration is in flight (#238).
+_KV_SAVE_SORT = "save_sort_settings"
+_KV_SAVE_SORT_PREVIOUS = "save_sort_settings_previous"
 
 if TYPE_CHECKING:
     import logging
@@ -29,6 +37,7 @@ if TYPE_CHECKING:
         CoreResolverFn,
         RetroDeckPaths,
         SaveFileStore,
+        UnitOfWorkFactory,
     )
 
 
@@ -36,13 +45,14 @@ if TYPE_CHECKING:
 class RomInfoServiceConfig:
     """Frozen wiring bundle handed to ``RomInfoService.__init__``.
 
-    Holds the main plugin state dict (for ``installed_roms`` reads and
-    save-sort state), the Protocol-typed filesystem adapter, the
-    RetroDECK runtime-path accessor, the ES-DE core resolver, the
-    RetroArch core-name provider, and the standard-library logger.
+    Holds the Unit-of-Work factory (the ``rom_installs`` aggregate is the
+    source of truth for installed-ROM file records — WS3 — and ``kv_config``
+    holds the save-sort markers), the Protocol-typed filesystem adapter, the
+    RetroDECK runtime-path accessor, the ES-DE core resolver, the RetroArch
+    core-name provider, and the standard-library logger.
     """
 
-    state: PluginState
+    uow_factory: UnitOfWorkFactory
     save_file_store: SaveFileStore
     retrodeck_paths: RetroDeckPaths
     get_active_core: CoreResolverFn
@@ -55,7 +65,7 @@ class RomInfoService:
 
     def __init__(self, *, config: RomInfoServiceConfig) -> None:
         self._config = config
-        self._state = config.state
+        self._uow_factory = config.uow_factory
         self._save_file_store = config.save_file_store
         self._retrodeck_paths = config.retrodeck_paths
         self._get_active_core = config.get_active_core
@@ -68,13 +78,13 @@ class RomInfoService:
         Returns dict with keys: system, rom_name, saves_dir, platform_slug, file_path
         or None if not installed.
         """
-        rom_id_str = str(int(rom_id))
-        installed = self._state["installed_roms"].get(rom_id_str)
+        with self._uow_factory() as uow:
+            installed = uow.rom_installs.get(int(rom_id))
         if not installed:
             return None
-        system = installed.get("system", "")
-        file_path = installed.get("file_path", "")
-        platform_slug = installed.get("platform_slug", "")
+        system = installed.system
+        file_path = installed.file_path
+        platform_slug = installed.platform_slug
         if not system or not file_path:
             return None
         rom_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -88,7 +98,7 @@ class RomInfoService:
         # and risk downloading stale server content to the new layout (#238).
         saves_base = self._retrodeck_paths.saves_path()
         roms_base = self._retrodeck_paths.roms_path()
-        sort_state = self.pending_sort_settings() or self._state.get("save_sort_settings")
+        sort_state = self.pending_sort_settings() or self._read_current_sort_settings()
         if sort_state:
             sort_by_content = sort_state.get("sort_by_content", True)
             sort_by_core = sort_state.get("sort_by_core", False)
@@ -197,8 +207,16 @@ class RomInfoService:
         ``{}`` as "pending" (and gate sync). Both call sites must agree on
         what counts as pending — see #238 review finding 3.
         """
-        prev = self._state.get("save_sort_settings_previous")
+        with self._uow_factory() as uow:
+            raw = uow.kv_config.get(_KV_SAVE_SORT_PREVIOUS)
+        prev: SaveSortSettings | None = json.loads(raw) if raw is not None else None
         return prev if prev else None
+
+    def _read_current_sort_settings(self) -> SaveSortSettings | None:
+        """Return the last-seen RetroArch save-sort observation, ``None`` when unobserved."""
+        with self._uow_factory() as uow:
+            raw = uow.kv_config.get(_KV_SAVE_SORT)
+        return json.loads(raw) if raw is not None else None
 
     def is_save_sort_changed(self) -> bool:
         """Check if a save sort migration is pending (detected by MigrationService)."""

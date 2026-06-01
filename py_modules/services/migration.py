@@ -10,11 +10,12 @@ remain the service's responsibility.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from models.state import InstalledRomEntry, PluginState, SaveSortSettings
+from models.state import SaveSortSettings
 
 from domain.save_extensions import get_save_extensions
 from domain.save_path import resolve_save_dir
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Callable
 
+    from domain.rom_install import RomInstall
     from services.protocols import (
         CoreNameProviderFn,
         CoreResolverFn,
@@ -31,34 +33,34 @@ if TYPE_CHECKING:
         RetroArchSaveSortingProvider,
         RetroDeckPaths,
         SettingsPersister,
-        StatePersister,
+        UnitOfWorkFactory,
     )
 
-
-# Settings schema version that introduced the fetch/apply split (#738).
-# Pre-v2 plugin runs may have left the metadata cache corrupted by a
-# delta-sync that overwrote populated entries with empty ones. Clearing
-# ``last_sync`` on the v1→v2 hop forces the next sync to do a full
-# fetch, which re-stamps the cache from real ROMs.
-_SETTINGS_VERSION_FETCH_APPLY_SPLIT = 2
+# kv_config keys for the cross-run change-detection markers MigrationService
+# diffs (ADR-0003 Bucket 2): the last-seen RetroDECK home and RetroArch
+# save-sort observation, each with a ``_previous`` companion that exists only
+# while a migration is awaiting user confirmation.
+_KV_RETRODECK_HOME = "retrodeck_home_path"
+_KV_RETRODECK_HOME_PREVIOUS = "retrodeck_home_path_previous"
+_KV_SAVE_SORT = "save_sort_settings"
+_KV_SAVE_SORT_PREVIOUS = "save_sort_settings_previous"
 
 
 @dataclass(frozen=True)
 class MigrationServiceConfig:
     """Frozen wiring bundle handed to ``MigrationService.__init__``.
 
-    Holds the Protocol-typed migration-file adapter, the live state
-    and settings dicts, runtime infrastructure, persistence callbacks,
-    event emitter, and the provider callables MigrationService needs
-    at construction time.
+    Holds the Protocol-typed migration-file adapter, the live settings
+    dict, runtime infrastructure, persistence callbacks, event emitter,
+    and the provider callables MigrationService needs at construction
+    time. Relational migration state (ROM installs, BIOS records, change
+    markers) is read through the injected ``uow_factory``.
     """
 
     migration_file_store: MigrationFileStore
-    state: PluginState
     settings: dict
     loop: asyncio.AbstractEventLoop
     logger: logging.Logger
-    state_persister: StatePersister
     settings_persister: SettingsPersister
     emit: EventEmitter
     get_bios_files_index: Callable[[], dict]
@@ -66,6 +68,7 @@ class MigrationServiceConfig:
     get_retroarch_save_sorting: RetroArchSaveSortingProvider
     get_active_core: CoreResolverFn
     get_core_name: CoreNameProviderFn
+    uow_factory: UnitOfWorkFactory
 
 
 class MigrationService:
@@ -73,11 +76,9 @@ class MigrationService:
 
     def __init__(self, *, config: MigrationServiceConfig) -> None:
         self._migration_file_store = config.migration_file_store
-        self._state = config.state
         self._settings = config.settings
         self._loop = config.loop
         self._logger = config.logger
-        self._state_persister = config.state_persister
         self._settings_persister = config.settings_persister
         self._emit = config.emit
         self._get_bios_files_index = config.get_bios_files_index
@@ -85,6 +86,7 @@ class MigrationService:
         self._get_retroarch_save_sorting = config.get_retroarch_save_sorting
         self._get_active_core = config.get_active_core
         self._get_core_name = config.get_core_name
+        self._uow_factory = config.uow_factory
         # Strong refs to in-flight background tasks. ``loop.create_task``
         # alone is not enough — without a strong ref, the loop is free to
         # garbage-collect the task before it completes. ``add_done_callback``
@@ -115,35 +117,12 @@ class MigrationService:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
-    # ---------------------------------------------------------------------------
-    # Settings-schema migrations (#738)
-    # ---------------------------------------------------------------------------
-
-    def apply_settings_schema_migrations(self) -> None:
-        """Apply one-shot settings-schema migrations on plugin start.
-
-        Plugin runs older than v2 may have left the metadata cache
-        corrupted by a delta sync that overwrote populated entries with
-        empty ones (#738). The migration clears ``last_sync`` so the
-        next sync does a full re-fetch, which re-stamps every cache
-        entry from real ROMs. The settings file's ``version`` field is
-        stamped on the next ``save_settings`` write (handled by the
-        persistence adapter), but we persist immediately here so the
-        bump lands even if the user makes no settings changes.
-        """
-        version = self._settings.get("version", 0)
-        if version < _SETTINGS_VERSION_FETCH_APPLY_SPLIT:
-            self._state["last_sync"] = None
-            self._state_persister.save_state()
-            self._settings_persister.save_settings()
-            self._logger.info(
-                "Settings schema migration v1→v2: cleared last_sync to force full resync (fixes #738 cache corruption)"
-            )
-
     def detect_retrodeck_path_change(self) -> None:
         """Check if RetroDECK home path changed since last run."""
         current_home = self._retrodeck_paths.retrodeck_home()
-        stored_home = self._state.get("retrodeck_home_path", "")
+        with self._uow_factory() as uow:
+            stored_home = uow.kv_config.get(_KV_RETRODECK_HOME) or ""
+            stored_previous = uow.kv_config.get(_KV_RETRODECK_HOME_PREVIOUS) or ""
 
         if not current_home:
             return
@@ -157,17 +136,17 @@ class MigrationService:
 
         if not stored_home:
             # First run — just store the current path, no migration needed
-            self._state["retrodeck_home_path"] = current_home
-            self._state_persister.save_state()
+            with self._uow_factory() as uow:
+                uow.kv_config.set(_KV_RETRODECK_HOME, current_home)
             return
 
         # Auto-clear: user reverted RetroDECK to the previous home before migrating.
         # The "previous" path is now the live one — no migration needed, drop the marker.
-        if current_home == self._state.get("retrodeck_home_path_previous"):
-            previous = self._state.get("retrodeck_home_path_previous", "")
-            self._state.pop("retrodeck_home_path_previous", None)
-            self._state["retrodeck_home_path"] = current_home
-            self._state_persister.save_state()
+        if current_home == stored_previous:
+            previous = stored_previous
+            with self._uow_factory() as uow:
+                uow.kv_config.delete(_KV_RETRODECK_HOME_PREVIOUS)
+                uow.kv_config.set(_KV_RETRODECK_HOME, current_home)
             self._logger.info(f"RetroDECK home reverted to previous path; clearing migration marker: {current_home}")
             # Notify the frontend so any pending migration UI can dismiss itself.
             # ``cleared: True`` lets the listener distinguish from the path-change emit.
@@ -186,9 +165,9 @@ class MigrationService:
         old_home = stored_home
 
         # Path changed — store both old and new, emit event
-        self._state["retrodeck_home_path_previous"] = old_home
-        self._state["retrodeck_home_path"] = current_home
-        self._state_persister.save_state()
+        with self._uow_factory() as uow:
+            uow.kv_config.set(_KV_RETRODECK_HOME_PREVIOUS, old_home)
+            uow.kv_config.set(_KV_RETRODECK_HOME, current_home)
         self._logger.warning(f"RetroDECK home path changed: {old_home} -> {current_home}")
         self._spawn_background_task(
             self._emit(
@@ -202,77 +181,139 @@ class MigrationService:
 
     def is_retrodeck_migration_pending(self) -> bool:
         """Return True if a RetroDECK home path migration is pending."""
-        return bool(self._state.get("retrodeck_home_path_previous"))
+        with self._uow_factory() as uow:
+            return bool(uow.kv_config.get(_KV_RETRODECK_HOME_PREVIOUS))
 
     def dismiss_retrodeck_migration(self) -> dict:
         """Dismiss the RetroDECK path migration warning without migrating files."""
-        self._state.pop("retrodeck_home_path_previous", None)
-        self._state_persister.save_state()
+        with self._uow_factory() as uow:
+            uow.kv_config.delete(_KV_RETRODECK_HOME_PREVIOUS)
         return {"success": True}
 
-    def _collect_rom_items(self, old_home, new_home):
-        """Collect ROM migration items from installed_roms state."""
+    def _collect_rom_items(self, old_home, new_home, installs, relocations):
+        """Collect ROM migration items from the installed-ROM records.
+
+        ``installs`` is a pre-snapshotted list of ``RomInstall`` records (the
+        caller opens the read UoW). Emits exactly **one** move unit per install
+        (never both a file and its enclosing directory): a folder-backed ROM
+        (``rom_dir`` set) moves the whole directory as a unit — kind
+        ``"rom_dir"`` — so sibling disc/update/DLC files travel with it; a
+        single-file ROM (``rom_dir`` is ``None``) moves just the launch file —
+        kind ``"rom"``. Each item carries a success-hook updater that records
+        the intended relocation into *relocations* (keyed by ``rom_id``) when
+        its move/skip succeeds; the relocations are applied to ``rom_installs``
+        in a separate write UoW after the file moves complete (ADR-0006).
+        """
         items = []
-        for entry in self._state["installed_roms"].values():
-            for key in ("file_path", "rom_dir"):
-                path = entry.get(key, "")
-                if not path or not path.startswith(old_home + os.sep):
-                    continue
-                new_path = os.path.join(new_home, os.path.relpath(path, old_home))
-
-                def make_rom_updater(e, k, np):
-                    def update():
-                        e[k] = np
-
-                    return update
-
+        for install in installs:
+            rom_dir = install.rom_dir
+            if rom_dir and rom_dir.startswith(old_home + os.sep):
+                # Multi-file ROM: move the whole dedicated directory as a unit.
+                # The launch file lives inside it, so its new path follows the
+                # directory's new location.
+                new_rom_dir = os.path.join(new_home, os.path.relpath(rom_dir, old_home))
+                new_file_path = os.path.join(new_rom_dir, os.path.relpath(install.file_path, rom_dir))
                 items.append(
                     (
-                        os.path.basename(path),
-                        path,
-                        new_path,
-                        make_rom_updater(entry, key, new_path),
-                        "rom" if key == "file_path" else "rom_dir",
+                        os.path.basename(rom_dir),
+                        rom_dir,
+                        new_rom_dir,
+                        self._make_rom_relocation_updater(relocations, install.rom_id, new_rom_dir, new_file_path),
+                        "rom_dir",
+                    )
+                )
+            else:
+                # Single-file ROM: move only the launch file; it owns no folder.
+                file_path = install.file_path
+                if not file_path or not file_path.startswith(old_home + os.sep):
+                    continue
+                new_file_path = os.path.join(new_home, os.path.relpath(file_path, old_home))
+                items.append(
+                    (
+                        os.path.basename(file_path),
+                        file_path,
+                        new_file_path,
+                        self._make_rom_relocation_updater(relocations, install.rom_id, None, new_file_path),
+                        "rom",
                     )
                 )
         return items
 
-    def _collect_tracked_bios_items(self, old_home, new_home):
-        """Collect tracked BIOS migration items from downloaded_bios state."""
+    @staticmethod
+    def _make_rom_relocation_updater(relocations, rom_id, new_rom_dir, new_file_path):
+        """Build a success-hook closure that records one install's new paths.
+
+        The migration loop calls the returned updater once the move (or skip)
+        for this install's single move unit succeeds. It records the new
+        ``rom_dir`` (``None`` for a single-file ROM) and ``file_path`` per
+        ``rom_id`` into *relocations* so the post-move write UoW can apply
+        ``RomInstall.relocate`` for each moved install.
+        """
+
+        def update():
+            relocations[rom_id] = {"rom_dir": new_rom_dir, "file_path": new_file_path}
+
+        return update
+
+    def _collect_tracked_bios_items(self, old_home, new_home, bios_files, relocations):
+        """Collect tracked BIOS migration items from the ``BiosFile`` snapshot.
+
+        ``bios_files`` is a pre-snapshotted list of ``BiosFile`` records (the
+        caller opens the read UoW). Each item carries a success-hook updater
+        that records the intended new ``file_path`` into *relocations* (keyed by
+        the aggregate's composite identity ``(platform_slug, file_name)``) when
+        its move/skip succeeds; the relocations are applied to ``bios_files`` in
+        a separate write UoW after the file moves complete (ADR-0006).
+        """
         items = []
-        for file_name, bios_entry in self._state.get("downloaded_bios", {}).items():
-            file_path = bios_entry.get("file_path", "")
+        for bios_file in bios_files:
+            file_path = bios_file.file_path
             if not file_path or not file_path.startswith(old_home + os.sep):
                 continue
             new_path = os.path.join(new_home, os.path.relpath(file_path, old_home))
-
-            def make_bios_updater(be, np):
-                def update():
-                    be["file_path"] = np
-
-                return update
-
+            key = (bios_file.platform_slug, bios_file.file_name)
             items.append(
                 (
-                    file_name,
+                    bios_file.file_name,
                     file_path,
                     new_path,
-                    make_bios_updater(bios_entry, new_path),
+                    self._make_bios_relocation_updater(relocations, key, new_path),
                     "bios",
                 )
             )
         return items
 
-    def _collect_untracked_bios_items(self, old_home):
-        """Collect untracked BIOS migration items (downloaded before state tracking)."""
+    @staticmethod
+    def _make_bios_relocation_updater(relocations, key, new_path):
+        """Build a success-hook closure that records one BIOS file's new path.
+
+        The migration loop calls the returned updater once the move (or skip)
+        for this BIOS file succeeds. It records the new ``file_path`` keyed by
+        the aggregate's composite identity ``(platform_slug, file_name)`` into
+        *relocations* so the post-move write UoW can apply ``BiosFile.relocate``
+        for each moved record.
+        """
+
+        def update():
+            relocations[key] = new_path
+
+        return update
+
+    def _collect_untracked_bios_items(self, old_home, tracked_file_names):
+        """Collect untracked BIOS migration items (downloaded before state tracking).
+
+        ``tracked_file_names`` is the set of BIOS file names already covered by
+        the ``BiosFile`` snapshot, so those tracked records aren't moved twice.
+        Untracked BIOS files have no aggregate record, so their move carries a
+        no-op updater (nothing to persist).
+        """
         items = []
         old_bios = os.path.join(old_home, "bios")
         new_bios = self._retrodeck_paths.bios_path()
         if not self._migration_file_store.is_dir(old_bios):
             return items
-        downloaded_bios = self._state.get("downloaded_bios", {})
         for file_name, reg_entry in self._get_bios_files_index().items():
-            if file_name in downloaded_bios:
+            if file_name in tracked_file_names:
                 continue
             firmware_path = reg_entry.get("firmware_path", file_name)
             old_file = os.path.join(old_bios, firmware_path)
@@ -310,16 +351,21 @@ class MigrationService:
                 items.append((rel, old_file, new_file, lambda: None, "save"))
         return items
 
-    def _collect_migration_items(self, old_home, new_home):
+    def _collect_migration_items(self, old_home, new_home, installs, bios_files, relocations, bios_relocations):
         """Collect all files that need migration across ROMs, BIOS, and saves.
 
         Returns list of (label, old_path, new_path, state_update_fn, kind) tuples.
         state_update_fn is called after a successful move/skip to update state.
+        ``installs``/``bios_files`` are the pre-snapshotted ``RomInstall`` and
+        ``BiosFile`` lists; ``relocations`` accumulates the per-``rom_id`` new
+        paths and ``bios_relocations`` the per-``(platform_slug, file_name)`` new
+        paths for the post-move write UoW.
         """
+        tracked_bios_names = {bf.file_name for bf in bios_files}
         items = []
-        items.extend(self._collect_rom_items(old_home, new_home))
-        items.extend(self._collect_tracked_bios_items(old_home, new_home))
-        items.extend(self._collect_untracked_bios_items(old_home))
+        items.extend(self._collect_rom_items(old_home, new_home, installs, relocations))
+        items.extend(self._collect_tracked_bios_items(old_home, new_home, bios_files, bios_relocations))
+        items.extend(self._collect_untracked_bios_items(old_home, tracked_bios_names))
         items.extend(self._collect_save_items(old_home))
         return items
 
@@ -333,7 +379,9 @@ class MigrationService:
 
     def _migrate_single_item(self, label, old_path, new_path, state_updater, kind, conflict_strategy, counts, errors):
         """Migrate a single file/directory item. Updates counts and errors in place."""
-        count_key = kind if kind != "rom_dir" else None
+        # A moved per-ROM directory ("rom_dir") counts as one migrated ROM, same
+        # as a single-file ROM ("rom") — both fold into the "rom" counter.
+        count_key = "rom" if kind in ("rom", "rom_dir") else kind
 
         if not self._migration_file_store.exists(old_path):
             if self._migration_file_store.exists(new_path):
@@ -424,7 +472,12 @@ class MigrationService:
 
     def _migrate_retrodeck_files_io(self, old_home, new_home, conflict_strategy):
         """Sync helper for migrate_retrodeck_files — FS traversal + moves in executor."""
-        items = self._collect_migration_items(old_home, new_home)
+        with self._uow_factory() as uow:
+            installs = list(uow.rom_installs.iter_all())
+            bios_files = list(uow.bios_files.iter_all())
+        relocations: dict[int, dict[str, str]] = {}
+        bios_relocations: dict[tuple[str, str], str] = {}
+        items = self._collect_migration_items(old_home, new_home, installs, bios_files, relocations, bios_relocations)
         conflicts = self._find_conflicts(items)
 
         # If no strategy given and there are conflicts, return them for user decision
@@ -452,12 +505,41 @@ class MigrationService:
                 errors,
             )
 
-        # Clear previous path marker after migration
-        if not errors:
-            self._state.pop("retrodeck_home_path_previous", None)
-        self._state_persister.save_state()
+        # Apply the relocations the per-item updaters accumulated and clear the
+        # previous-path marker, all in one short write UoW after the file moves.
+        self._apply_relocations(installs, relocations, bios_files, bios_relocations, clear_marker=not errors)
 
         return self._build_migration_result(counts, errors)
+
+    def _apply_relocations(self, installs, relocations, bios_files, bios_relocations, *, clear_marker):
+        """Persist the relocated install and BIOS records (and optionally clear the marker).
+
+        Opens a single write UoW after the file moves: for every install whose
+        move/skip succeeded, calls ``RomInstall.relocate`` with the new
+        ``rom_dir`` (``None`` for a single-file ROM) and ``file_path``; for every
+        BIOS record whose move/skip succeeded, calls ``BiosFile.relocate`` with
+        the new ``file_path``. Both are saved in the same transaction. When
+        *clear_marker* is true (a fully-successful migration) the
+        ``retrodeck_home_path_previous`` marker is deleted in the same
+        transaction.
+        """
+        by_id = {install.rom_id: install for install in installs}
+        by_key = {(bf.platform_slug, bf.file_name): bf for bf in bios_files}
+        with self._uow_factory() as uow:
+            for rom_id, moved in relocations.items():
+                install = by_id.get(rom_id)
+                if install is None:
+                    continue
+                install.relocate(moved["rom_dir"], moved["file_path"])
+                uow.rom_installs.save(install)
+            for key, new_path in bios_relocations.items():
+                bios_file = by_key.get(key)
+                if bios_file is None:
+                    continue
+                bios_file.relocate(new_path)
+                uow.bios_files.save(bios_file)
+            if clear_marker:
+                uow.kv_config.delete(_KV_RETRODECK_HOME_PREVIOUS)
 
     async def migrate_retrodeck_files(self, conflict_strategy=None):
         """Move downloaded ROMs, BIOS, and save files from old RetroDECK path to new.
@@ -467,8 +549,9 @@ class MigrationService:
                 replace existing destination files, "skip" to keep existing files
                 and just update state paths.
         """
-        old_home = self._state.get("retrodeck_home_path_previous", "")
-        new_home = self._state.get("retrodeck_home_path", "")
+        with self._uow_factory() as uow:
+            old_home = uow.kv_config.get(_KV_RETRODECK_HOME_PREVIOUS) or ""
+            new_home = uow.kv_config.get(_KV_RETRODECK_HOME) or ""
 
         if not old_home or not new_home or old_home == new_home:
             return {"success": False, "message": "No path migration needed"}
@@ -479,8 +562,11 @@ class MigrationService:
 
     def _get_migration_status_io(self, old_home, new_home):
         """Sync helper for get_migration_status — FS traversal in executor."""
-        items = self._collect_migration_items(old_home, new_home)
-        roms_count = sum(1 for _, _, _, _, kind in items if kind == "rom")
+        with self._uow_factory() as uow:
+            installs = list(uow.rom_installs.iter_all())
+            bios_files = list(uow.bios_files.iter_all())
+        items = self._collect_migration_items(old_home, new_home, installs, bios_files, {}, {})
+        roms_count = sum(1 for _, _, _, _, kind in items if kind in ("rom", "rom_dir"))
         bios_count = sum(1 for _, _, _, _, kind in items if kind == "bios")
         saves_count = sum(1 for _, _, _, _, kind in items if kind == "save")
 
@@ -495,8 +581,9 @@ class MigrationService:
 
     async def get_migration_status(self):
         """Return whether a RetroDECK path migration is pending and file counts."""
-        old_home = self._state.get("retrodeck_home_path_previous", "")
-        new_home = self._state.get("retrodeck_home_path", "")
+        with self._uow_factory() as uow:
+            old_home = uow.kv_config.get(_KV_RETRODECK_HOME_PREVIOUS) or ""
+            new_home = uow.kv_config.get(_KV_RETRODECK_HOME) or ""
 
         if not old_home or not new_home or old_home == new_home:
             return {"pending": False}
@@ -506,6 +593,18 @@ class MigrationService:
     # ---------------------------------------------------------------------------
     # Save sort change detection and migration
     # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _read_save_sort_settings(uow) -> SaveSortSettings | None:
+        """Decode the last-seen save-sort observation from kv_config, ``None`` when absent."""
+        raw = uow.kv_config.get(_KV_SAVE_SORT)
+        return json.loads(raw) if raw is not None else None
+
+    @staticmethod
+    def _read_save_sort_settings_previous(uow) -> SaveSortSettings | None:
+        """Decode the pending pre-change save-sort snapshot from kv_config, ``None`` when absent."""
+        raw = uow.kv_config.get(_KV_SAVE_SORT_PREVIOUS)
+        return json.loads(raw) if raw is not None else None
 
     def detect_save_sort_change(self) -> None:
         """Check if RetroArch save sorting settings changed since last run.
@@ -520,16 +619,17 @@ class MigrationService:
         """
         sort_by_content, sort_by_core = self._get_retroarch_save_sorting()
         current: SaveSortSettings = {"sort_by_content": sort_by_content, "sort_by_core": sort_by_core}
-        stored = self._state.get("save_sort_settings")
+        with self._uow_factory() as uow:
+            stored = self._read_save_sort_settings(uow)
         if stored is None:
-            self._state["save_sort_settings"] = current
-            self._state_persister.save_state()
+            with self._uow_factory() as uow:
+                uow.kv_config.set(_KV_SAVE_SORT, json.dumps(current))
             return
         if stored == current:
             return
-        self._state["save_sort_settings_previous"] = stored
-        self._state["save_sort_settings"] = current
-        self._state_persister.save_state()
+        with self._uow_factory() as uow:
+            uow.kv_config.set(_KV_SAVE_SORT_PREVIOUS, json.dumps(stored))
+            uow.kv_config.set(_KV_SAVE_SORT, json.dumps(current))
         self._logger.warning(f"RetroArch save sorting changed: {stored} -> {current}")
         # Fire-and-forget: thread-safe schedule of the emit coroutine on
         # the plugin event loop. We deliberately do not await or .result()
@@ -563,15 +663,24 @@ class MigrationService:
         corename = self._get_core_name(core_so)
         return (corename or None, core_so)
 
-    def _collect_save_sorting_items(self, old_settings: SaveSortSettings, new_settings: SaveSortSettings) -> list:
-        """Collect save files that need migration due to sort setting change."""
+    def _collect_save_sorting_items(
+        self,
+        old_settings: SaveSortSettings,
+        new_settings: SaveSortSettings,
+        installs: list[RomInstall],
+    ) -> list:
+        """Collect save files that need migration due to sort setting change.
+
+        ``installs`` is the pre-snapshotted ``RomInstall`` list (the caller opens
+        the read UoW); this method is pure compute over it.
+        """
         saves_base = self._retrodeck_paths.saves_path()
         roms_base = self._retrodeck_paths.roms_path()
         need_core = bool(old_settings.get("sort_by_core") or new_settings.get("sort_by_core"))
         items: list[tuple[str, str, str, object, str]] = []
-        for entry in self._state.get("installed_roms", {}).values():
+        for install in installs:
             self._collect_rom_sort_items(
-                entry,
+                install,
                 saves_base,
                 roms_base,
                 old_settings,
@@ -583,7 +692,7 @@ class MigrationService:
 
     def _collect_rom_sort_items(
         self,
-        entry: InstalledRomEntry,
+        install: RomInstall,
         saves_base: str,
         roms_base: str,
         old_settings: SaveSortSettings,
@@ -592,9 +701,9 @@ class MigrationService:
         items: list,
     ) -> None:
         """Collect migration items for a single ROM's save files."""
-        system = entry.get("system", "")
-        file_path = entry.get("file_path", "")
-        platform_slug = entry.get("platform_slug", "")
+        system = install.system
+        file_path = install.file_path
+        platform_slug = install.platform_slug
         if not system or not file_path:
             return
         core_name: str | None = None
@@ -644,7 +753,9 @@ class MigrationService:
     def _get_save_sort_migration_status_io(
         self, old_settings: SaveSortSettings, new_settings: SaveSortSettings
     ) -> dict:
-        items = self._collect_save_sorting_items(old_settings, new_settings)
+        with self._uow_factory() as uow:
+            installs = list(uow.rom_installs.iter_all())
+        items = self._collect_save_sorting_items(old_settings, new_settings, installs)
         return {
             "pending": True,
             "old_settings": old_settings,
@@ -654,13 +765,14 @@ class MigrationService:
 
     def dismiss_save_sort_migration(self) -> dict:
         """Dismiss the save sort migration warning without migrating files."""
-        self._state.pop("save_sort_settings_previous", None)
-        self._state_persister.save_state()
+        with self._uow_factory() as uow:
+            uow.kv_config.delete(_KV_SAVE_SORT_PREVIOUS)
         return {"success": True}
 
     async def get_save_sort_migration_status(self) -> dict:
-        old = self._state.get("save_sort_settings_previous")
-        new = self._state.get("save_sort_settings")
+        with self._uow_factory() as uow:
+            old = self._read_save_sort_settings_previous(uow)
+            new = self._read_save_sort_settings(uow)
         if not old or not new or old == new:
             return {"pending": False}
         return await self._loop.run_in_executor(None, self._get_save_sort_migration_status_io, old, new)
@@ -737,10 +849,12 @@ class MigrationService:
         # callable signature but is unused for save-sort migration — conflicts
         # are resolved in place via newest-wins (see _resolve_save_sort_conflict).
         del conflict_strategy
-        items = self._collect_save_sorting_items(old_settings, new_settings)
+        with self._uow_factory() as uow:
+            installs = list(uow.rom_installs.iter_all())
+        items = self._collect_save_sorting_items(old_settings, new_settings, installs)
         if not items:
-            self._state.pop("save_sort_settings_previous", None)
-            self._state_persister.save_state()
+            with self._uow_factory() as uow:
+                uow.kv_config.delete(_KV_SAVE_SORT_PREVIOUS)
             return {"success": True, "message": "No save files to migrate", "saves_moved": 0}
         counts: dict[str, int] = {"rom": 0, "bios": 0, "save": 0}
         errors: list[str] = []
@@ -750,13 +864,14 @@ class MigrationService:
             else:
                 self._migrate_single_item(label, old_path, new_path, updater, "save", None, counts, errors)
         if not errors:
-            self._state.pop("save_sort_settings_previous", None)
-            self._state_persister.save_state()
+            with self._uow_factory() as uow:
+                uow.kv_config.delete(_KV_SAVE_SORT_PREVIOUS)
         return self._build_migration_result(counts, errors)
 
     async def migrate_save_sort_files(self, conflict_strategy: str | None = None) -> dict:
-        old = self._state.get("save_sort_settings_previous")
-        new = self._state.get("save_sort_settings")
+        with self._uow_factory() as uow:
+            old = self._read_save_sort_settings_previous(uow)
+            new = self._read_save_sort_settings(uow)
         if not old or not new or old == new:
             return {"success": False, "message": "No save sorting migration needed"}
         return await self._loop.run_in_executor(None, self._migrate_save_sort_files_io, old, new, conflict_strategy)

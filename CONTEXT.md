@@ -46,6 +46,31 @@ the decorator nor the verb-method discipline an aggregate root does.
 `FileSyncState` (inside `RomSaveState`) is the canonical example. The foil to
 **Aggregate**: a root has identity and methods; a value object has neither.
 
+### Repository
+
+The single persistence seam for one **Aggregate** — "give me this aggregate by
+id, save this aggregate." Exactly one Repository per aggregate root (Protocol in
+`services/protocols/`, SQLite adapter behind it). It may touch several tables to
+reconstruct or persist the aggregate — the `RomSaveState` repository spans
+`rom_save_states` + `rom_save_files` — but callers see only `get(id)` /
+`save(id, aggregate)`. It *is* the load/save layer; the service layer never
+wraps it in a second one (no `StateService`-style holder between service and
+repository). Reached only through the **Unit of Work** (`uow.rom_save_states`,
+`uow.rom_installs`, …), never constructed directly.
+
+### Unit of Work
+
+The atomic transaction boundary one operation works inside, and the carrier of
+the **Repositories** for that transaction. Owned by the service layer at the
+operation's entry (never by `main.py` callables); a `with uow:` block opens one
+connection, exposes the repositories, and commits on clean exit / rolls back on
+exception (stdlib `sqlite3` + `run_in_executor`, per
+[ADR-0004](docs/adr/0004-sync-sqlite-unit-of-work.md)). Kept **narrow** — it
+wraps only the database reads/writes, never network/file I/O or a frontend
+round-trip; cross-operation consistency comes from the operation's own
+serialization (the per-ROM save lock, the single library-sync task), not from
+holding a UoW open.
+
 ### Persistence boundary (settings.json / save_sync_state.json / SQLite)
 
 Where a piece of persisted state lives is a deliberate decision driven by what
@@ -115,6 +140,33 @@ Three things spell similarly; distinct meanings:
 Convention: always write `Rom` (PascalCase) when referring to the aggregate.
 Write "ROM file" when referring to the on-disk artifact.
 
+### file_path vs rom_dir (RomInstall paths)
+
+The two path fields on `RomInstall` (`domain/rom_install.py`) answer different
+questions and must not be conflated:
+
+- **`file_path`** — the **launch target**: the single file RetroDECK is handed
+  (`romm-launcher` execs it, per
+  [ADR-0005](docs/adr/0005-launcher-resolves-path-from-sqlite.md)). Present for
+  every ROM. Save-path resolution, ES-DE core resolution, and the displayed
+  filename all derive from it.
+- **`rom_dir`** — the **dedicated per-ROM directory**, present only for
+  folder-backed (multi-file) ROMs. **NULL for single-file ROMs**, which live as a
+  bare file directly in the shared `<roms>/<system>/` directory and own no
+  dedicated folder.
+
+Single-file vs multi-file is **read from `rom_dir` presence** — never re-derived
+from the file's parent directory, never stored as a separate boolean
+([ADR-0008](docs/adr/0008-rom-install-launch-file-and-rom-dir.md)). Migration
+moves `rom_dir` whole when set, else the file; uninstall removes `rom_dir` whole
+when set, else the file. A future per-file `RomFile[]` model — one row per
+physical file, each tagged with a RomM `category` (`game` / `dlc` / `update` /
+`mod` / …) — is the planned shape for the multi-file features in
+[#140](https://github.com/danielcopper/decky-romm-sync/issues/140) /
+[#129](https://github.com/danielcopper/decky-romm-sync/issues/129); it is an
+additive 1:N child of `rom_installs` (deferred until those land), and
+`file_path` + `rom_dir` are its forward-compatible projection.
+
 ### platform_slug (denormalized)
 
 The RomM platform identifier (e.g. `gba`, `psx`) carried as a plain string on
@@ -150,3 +202,29 @@ each tracked file it evaluates local vs remote vs **baseline** and resolves to
 whichever side is newer, rather than blindly mirroring one direction. The
 "matrix" is the per-file evaluation table that drives the actual upload /
 download / no-op dispatch for a ROM's sync run.
+
+### SyncRun
+
+One library-sync operation modelled as a first-class aggregate
+(`domain/sync_run.py`, `sync_runs` table) — a `running` → `completed` /
+`cancelled` / `errored` state machine carrying `started_at` / `finished_at`, the
+planned platform/ROM counts, and the lists of platforms/collections actually
+completed. Replaces the scattered JSON scalars `last_sync`, `sync_stats`,
+`last_synced_platforms`, `last_synced_collections`. One row per sync (inserted at
+apply-start, finalized at the end). The "how many ROMs" figure is **not** stored
+on it — that is a live `len(registry)` count computed at read time.
+
+### Unbind / stale / prune
+
+Three deliberately-distinct ROM-removal notions (see
+[ADR-0007](docs/adr/0007-rom-retention-identity-anchor.md)):
+
+- **Unbind** — drop a ROM's Steam-shortcut binding (`shortcut_app_id` → NULL, via
+  `Rom.unbind_shortcut()`) while keeping its `roms` row and all per-ROM state
+  (install, metadata, playtime, saves). What removing a shortcut does.
+- **Stale** — a ROM still in local state but no longer returned by RomM on a
+  sync. Triggers an **unbind**, never a delete: a stale signal may be a transient
+  server blip or a reversible RomM change, and local playtime/saves must survive.
+- **Prune** — an explicit, opt-in purge that `DELETE`s the `roms` row, cascading
+  every per-ROM child away atomically. The **only** thing that deletes rows; not
+  built yet (the cascade FKs exist for it).

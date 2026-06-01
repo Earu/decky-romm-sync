@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 from bootstrap import (
@@ -30,10 +29,7 @@ from fakes.fake_save_file_store import FakeSaveFileStore
 from fakes.fake_sgdb_artwork_cache import FakeSgdbArtworkCache
 from fakes.fake_unit_of_work import FakeUnitOfWorkFactory
 from fakes.system_time import FakeClock, FakeSleeper, FakeUuidGen
-from models.state import ShortcutRegistryEntry, make_default_plugin_state
 
-from adapters.metadata_cache_store import MetadataCacheStoreAdapter
-from adapters.registry_store import RegistryStoreAdapter
 from adapters.retrodeck_paths import RetroDeckPathsAdapter
 from adapters.romm.http import RommHttpAdapter
 from adapters.romm.romm_api import RommApiAdapter
@@ -102,22 +98,16 @@ class TestBootstrap:
         # CallbackBundle no longer carries it.
         assert not hasattr(result.callbacks, "core_info_provider")
 
-    def test_persistence_loaded_with_default_state_factory(self, tmp_path):
-        """First-run state contains the keys ``_default_state()`` ships.
+    def test_state_bundle_carries_only_settings(self, tmp_path):
+        """Post-cutover (#784) ``StateBundle`` holds only the live settings dict.
 
-        Regression for #671: ``_default_state`` must be a factory, not a
-        shared module-level dict — services mutate ``state`` in place.
+        The residual ``downloaded_bios`` JSON index was the last on-disk JSON
+        state read at startup; with BIOS migration on SQLite the bundle no
+        longer carries a ``state`` field.
         """
         result = _bootstrap_for(tmp_path)
-        state = result.stores.state
-        # Inner containers were independently constructed; mutating them
-        # does not bleed into a future bootstrap call's state.
-        state["shortcut_registry"]["sentinel"] = cast("ShortcutRegistryEntry", {"app_id": 1})
-        state["sync_stats"]["platforms"] = 42
-
-        second = _bootstrap_for(tmp_path)
-        assert second.stores.state["shortcut_registry"] == {}
-        assert second.stores.state["sync_stats"] == {"platforms": 0, "roms": 0}
+        assert result.stores.settings is not None
+        assert not hasattr(result.stores, "state")
 
     def test_handles_debug_logger_exposed(self, tmp_path):
         """``BootstrapHandles.debug_logger`` is the same instance the CallbackBundle wires."""
@@ -187,8 +177,6 @@ class TestWireServices:
         settings = {}
         http_adapter = MagicMock(spec=RommHttpAdapter)
         steam_config = SteamConfigAdapter(user_home=str(tmp_path), logger=logger)
-        state = make_default_plugin_state()
-        metadata_cache: dict = {}
         romm_api = MagicMock(spec=RommApiAdapter)
         return {
             "http_adapter": http_adapter,
@@ -204,10 +192,7 @@ class TestWireServices:
             "save_file_store": FakeSaveFileStore(),
             "gamelist_editor": MagicMock(),
             "path_probe": FakePathExistsReader(),
-            "state": state,
             "settings": settings,
-            "metadata_cache": metadata_cache,
-            "save_sync_state": {"saves": {}, "playtime": {}, "settings": {}},
             "loop": asyncio.new_event_loop(),
             "logger": logger,
             "plugin_dir": str(tmp_path / "plugin"),
@@ -226,14 +211,9 @@ class TestWireServices:
             ),
             "get_retroarch_save_sorting": MagicMock(return_value=(True, False)),
             "get_core_name": MagicMock(return_value="Snes9x"),
-            "state_persister": MagicMock(),
             "settings_persister": MagicMock(),
-            "metadata_cache_persister": MagicMock(),
             "firmware_cache_persister": FakeFirmwareCachePersister(),
             "core_info_provider": FakeCoreInfoProvider(),
-            "save_sync_state_persister": MagicMock(load=MagicMock(return_value=None), save=MagicMock()),
-            "registry_store": RegistryStoreAdapter(state=state, logger=logger),
-            "metadata_store": MetadataCacheStoreAdapter(metadata_cache=metadata_cache),
             "log_debug": MagicMock(),
             "plugin_metadata": FakePluginMetadataReader(version="0.14.0"),
             "uow_factory": FakeUnitOfWorkFactory(),
@@ -260,10 +240,7 @@ class TestWireServices:
                 core_info_provider=deps["core_info_provider"],
             ),
             stores=StateBundle(
-                state=deps["state"],
                 settings=deps["settings"],
-                metadata_cache=deps["metadata_cache"],
-                save_sync_state=deps["save_sync_state"],
             ),
             runtime=RuntimeBundle(
                 loop=deps["loop"],
@@ -280,13 +257,8 @@ class TestWireServices:
                 retrodeck_paths=deps["retrodeck_paths"],
                 get_retroarch_save_sorting=deps["get_retroarch_save_sorting"],
                 get_core_name=deps["get_core_name"],
-                state_persister=deps["state_persister"],
                 settings_persister=deps["settings_persister"],
-                metadata_cache_persister=deps["metadata_cache_persister"],
                 firmware_cache_persister=deps["firmware_cache_persister"],
-                save_sync_state_persister=deps["save_sync_state_persister"],
-                registry_store=deps["registry_store"],
-                metadata_store=deps["metadata_store"],
                 log_debug=deps["log_debug"],
                 plugin_metadata=deps["plugin_metadata"],
                 uow_factory=deps["uow_factory"],
@@ -307,12 +279,13 @@ class TestWireServices:
         assert isinstance(result["achievements_service"], AchievementsService)
         deps["loop"].close()
 
-    def test_services_share_state_reference(self, tmp_path):
+    def test_services_share_settings_reference(self, tmp_path):
         deps = self._make_deps(tmp_path)
         result = wire_services(self._make_config(deps))
-        # download_service and sync_service should share the same state dict
-        assert result["download_service"]._state is deps["state"]
-        assert result["sync_service"]._state is deps["state"]
+        # MigrationService holds the live settings dict; all relational
+        # migration state (installs, BIOS, markers) reads through the UoW
+        # factory after the SQLite cutover (#784).
+        assert result["migration_service"]._settings is deps["settings"]
         deps["loop"].close()
 
     def test_returns_expected_services(self, tmp_path):
@@ -422,21 +395,22 @@ class TestWireServices:
         assert save_sync_service._sync_engine._detect_sort_change.__self__ is migration_service  # type: ignore[union-attr]
         deps["loop"].close()
 
-    def test_save_sync_and_migration_share_state_reference(self, tmp_path):
+    def test_save_sync_and_migration_share_uow(self, tmp_path):
         """Regression test for #238: SaveService and MigrationService must
-        observe the same state dict by reference.
+        observe the same save-sort markers.
 
-        Without shared state, ``detect_save_sort_change`` would mutate
-        MigrationService's local copy while SaveService reads its own
-        stale copy — defeating the detect-first invariant.
+        Post-cutover the save-sort markers live in ``kv_config`` behind the
+        Unit of Work, so the detect-first invariant holds as long as
+        MigrationService (which writes the markers) and SaveService's
+        RomInfoService (which reads them) resolve the same UoW.
         """
         deps = self._make_deps(tmp_path)
+        shared_uow = deps["uow_factory"].uow
         result = wire_services(self._make_config(deps))
         save_sync_service = result["save_sync_service"]
         migration_service = result["migration_service"]
-        assert save_sync_service._state is deps["state"]
-        assert migration_service._state is deps["state"]
-        assert save_sync_service._state is migration_service._state
+        assert migration_service._uow_factory() is shared_uow
+        assert save_sync_service._rom_info._uow_factory() is shared_uow
         deps["loop"].close()
 
     def test_save_service_receives_is_retrodeck_migration_pending(self, tmp_path):
@@ -457,28 +431,30 @@ class TestWireServices:
 
     def test_save_sync_detect_sort_change_mutates_shared_state(self, tmp_path):
         """Functional check for #238: invoking the wired detect callback
-        from SaveService updates state that SaveService subsequently
-        reads.
+        from SaveService writes the marker SaveService subsequently reads.
 
-        The wired callback writes current sort settings into
-        ``_state["save_sort_settings"]`` on first run. SaveService and
-        MigrationService must see that write through the same live dict.
+        The wired callback writes the current sort settings into the
+        ``save_sort_settings`` ``kv_config`` marker on first run. SaveService
+        and MigrationService must see that write through the same UoW.
         """
+        import json
+
         deps = self._make_deps(tmp_path)
-        # The default mock returns (True, False); no prior state seeded
-        # (the factory default for ``save_sort_settings`` is ``None``).
-        assert deps["state"]["save_sort_settings"] is None
+        shared_uow = deps["uow_factory"].uow
+        # The default mock returns (True, False); no prior marker seeded.
+        with shared_uow as uow:
+            assert uow.kv_config.get("save_sort_settings") is None
         result = wire_services(self._make_config(deps))
         save_sync_service = result["save_sync_service"]
 
         # Invoke the bound detect callback SaveService received.
         save_sync_service._sync_engine._detect_sort_change()  # type: ignore[misc]
 
-        # State now has the current sort settings written through the
-        # shared dict — SaveService will read this on its next
-        # _get_rom_save_info call.
-        assert deps["state"]["save_sort_settings"] == {
-            "sort_by_content": True,
-            "sort_by_core": False,
-        }
+        # The marker now holds the current sort settings through the shared
+        # UoW — SaveService reads it on its next get_rom_save_info call.
+        with shared_uow as uow:
+            assert json.loads(uow.kv_config.get("save_sort_settings")) == {
+                "sort_by_content": True,
+                "sort_by_core": False,
+            }
         deps["loop"].close()

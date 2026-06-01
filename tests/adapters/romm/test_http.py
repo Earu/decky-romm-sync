@@ -5,11 +5,10 @@ import urllib.error
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fakes.library_peers import FakeArtworkManager, FakeMetadataExtractor
+from fakes.fake_unit_of_work import FakeUnitOfWorkFactory
+from fakes.library_peers import FakeArtworkManager
 from fakes.system_time import FakeClock, FakeSleeper, FakeUuidGen
-from models.state import make_default_plugin_state
 
-from adapters.registry_store import RegistryStoreAdapter
 from adapters.romm.http import RommHttpAdapter
 from adapters.steam_config import SteamConfigAdapter
 from lib.errors import (
@@ -42,8 +41,6 @@ def plugin():
         p.settings, decky.DECKY_PLUGIN_DIR, logging.getLogger("test"), "decky-romm-sync/9.9.9"
     )
     p._romm_api = MagicMock()
-    p._state = make_default_plugin_state()
-    p._metadata_cache = {}
 
     steam_config = SteamConfigAdapter(user_home=decky.DECKY_USER_HOME, logger=decky.logger)
     p._steam_config = steam_config
@@ -52,9 +49,7 @@ def plugin():
         config=LibraryServiceConfig(
             romm_api=p._romm_api,
             steam_config=steam_config,
-            state=p._state,
             settings=p.settings,
-            metadata_cache=p._metadata_cache,
             loop=asyncio.get_event_loop(),
             logger=decky.logger,
             plugin_dir=decky.DECKY_PLUGIN_DIR,
@@ -62,12 +57,10 @@ def plugin():
             clock=FakeClock(),
             uuid_gen=FakeUuidGen(),
             sleeper=FakeSleeper(),
-            state_persister=MagicMock(),
             settings_persister=MagicMock(),
-            registry_store=RegistryStoreAdapter(state=p._state, logger=decky.logger),
             log_debug=p._log_debug,
-            metadata_service=FakeMetadataExtractor(),
             artwork=FakeArtworkManager(),
+            uow_factory=FakeUnitOfWorkFactory(),
         ),
     )
 
