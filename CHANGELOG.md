@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.20.0](https://github.com/danielcopper/decky-romm-sync/compare/decky-romm-sync-v0.19.0...decky-romm-sync-v0.20.0) (2026-06-05)
+
+
+### ⚠ BREAKING CHANGES
+
+The JSON→SQLite migration and the rebuilt ROM launcher both require a re-sync
+after updating, and old Steam shortcuts must be removed. **Please read before
+upgrading.**
+
+**Your data is safe:** downloaded ROM files and on-disk save files are untouched,
+and nothing on the RomM server changes. Only the plugin's local tracking state
+resets and the Steam shortcuts are recreated (the launcher's path changed, so
+every shortcut gets a new app ID).
+
+**Upgrade steps — in order:**
+
+1. **If you use save sync:** in the QAM, open **Settings** and press **Sync All
+   Saves Now**, so your latest saves are on RomM before the local state resets.
+2. In the QAM, open **Data Management** and press **Remove All RomM Shortcuts** —
+   do this on the *current* version, before upgrading, so the old shortcuts are
+   cleaned up properly.
+3. Upgrade the plugin, then open **Settings** and confirm your configuration is
+   correct.
+4. Re-sync your library from RomM. This recreates the shortcuts and rebuilds the
+   plugin's tracking state; save-sync baselines re-establish on this sync.
+
+**Playtime** is restored automatically — opening a game's detail page pulls its
+total back from RomM (per game, on first view). Not restored: per-game session
+counts and "last played" timestamps, and any playtime that was never synced to
+RomM.
+
+The old JSON files (`state.json`, `metadata_cache.json`, `firmware_cache.json`,
+`save_sync_state.json`) are silently ignored and can be deleted by hand from the
+plugin's data directory.
+
+### Features
+
+* **auth:** add RomM Client API Token authentication ([#849](https://github.com/danielcopper/decky-romm-sync/issues/849)) ([67a2e96](https://github.com/danielcopper/decky-romm-sync/commit/67a2e96fdcc1179533694452096be35cad83d122)), closes [#163](https://github.com/danielcopper/decky-romm-sync/issues/163)
+* **domain:** add mid-tier aggregates for [#788](https://github.com/danielcopper/decky-romm-sync/issues/788) ([#816](https://github.com/danielcopper/decky-romm-sync/issues/816)) ([8f9e2bc](https://github.com/danielcopper/decky-romm-sync/commit/8f9e2bc4af13dc18e6b3adc99b441855566b3803))
+* **domain:** add RomSaveState and SyncRun aggregates for [#788](https://github.com/danielcopper/decky-romm-sync/issues/788) ([#817](https://github.com/danielcopper/decky-romm-sync/issues/817)) ([3b563ce](https://github.com/danielcopper/decky-romm-sync/commit/3b563ce6e3b999a648b82e6a6d33a96470b1c5f7))
+* **domain:** aggregate enforcement infrastructure for [#788](https://github.com/danielcopper/decky-romm-sync/issues/788) ([#814](https://github.com/danielcopper/decky-romm-sync/issues/814)) ([53a4868](https://github.com/danielcopper/decky-romm-sync/commit/53a4868184a5240ff611d930b90a65c483e90fe6))
+* **domain:** simple aggregates (Device, SyncSettings, Playtime) for [#788](https://github.com/danielcopper/decky-romm-sync/issues/788) ([#815](https://github.com/danielcopper/decky-romm-sync/issues/815)) ([cbc4fc0](https://github.com/danielcopper/decky-romm-sync/commit/cbc4fc0052b95063d732376a7b1c6cda6e90271c))
+* **persistence:** add SQLite migration framework (user_version) for [#781](https://github.com/danielcopper/decky-romm-sync/issues/781) ([#819](https://github.com/danielcopper/decky-romm-sync/issues/819)) ([84b5f3d](https://github.com/danielcopper/decky-romm-sync/commit/84b5f3dd28e3e51de742e9eb929223f3fa103dbc))
+* **persistence:** add SQLite repository adapters + sync Unit of Work ([#826](https://github.com/danielcopper/decky-romm-sync/issues/826)) ([a8334e2](https://github.com/danielcopper/decky-romm-sync/commit/a8334e2760bc9ab32b8427156b8427accc023d84)), closes [#783](https://github.com/danielcopper/decky-romm-sync/issues/783)
+* **persistence:** define Repository Protocols ([#782](https://github.com/danielcopper/decky-romm-sync/issues/782)) ([#825](https://github.com/danielcopper/decky-romm-sync/issues/825)) ([3955af6](https://github.com/danielcopper/decky-romm-sync/commit/3955af6ce2a6da27a1c0db2a0bf94bd01ea72b92))
+* **persistence:** SQLite schema DDL + table layout for [#780](https://github.com/danielcopper/decky-romm-sync/issues/780) ([#818](https://github.com/danielcopper/decky-romm-sync/issues/818)) ([a9fea00](https://github.com/danielcopper/decky-romm-sync/commit/a9fea008c802cac5553c5c310d935177cc754a2b))
+* **playtime:** reconcile playtime from RomM notes on game-detail open ([#905](https://github.com/danielcopper/decky-romm-sync/issues/905)) ([2e25eaf](https://github.com/danielcopper/decky-romm-sync/commit/2e25eaf08502c87d6aa8688364c31dc89aef7afa))
+* **saves:** single-token memory-card extensions, keyed by RetroDECK system ([#904](https://github.com/danielcopper/decky-romm-sync/issues/904)) ([040defd](https://github.com/danielcopper/decky-romm-sync/commit/040defd6a932a3ccfd259675562c43dcf62a6820))
+
+
+### Bug Fixes
+
+* **ci:** skip docs-check on release-please file changes ([#800](https://github.com/danielcopper/decky-romm-sync/issues/800)) ([451217d](https://github.com/danielcopper/decky-romm-sync/commit/451217d2dafd763a57925de9da080abcff7e74b9))
+* **docs:** exclude adr/ from published MkDocs site ([#809](https://github.com/danielcopper/decky-romm-sync/issues/809)) ([ad5c510](https://github.com/danielcopper/decky-romm-sync/commit/ad5c5105fc8ac2b838e3c814d236557d010af93e))
+* **downloads:** key multi-file detection on total file count, not has_multiple_files ([#857](https://github.com/danielcopper/decky-romm-sync/issues/857)) ([c49aac6](https://github.com/danielcopper/decky-romm-sync/commit/c49aac68fb4b605a05247560223d6a302bfbf1fe)), closes [#855](https://github.com/danielcopper/decky-romm-sync/issues/855) [#837](https://github.com/danielcopper/decky-romm-sync/issues/837)
+* **persistence:** upsert roms registry so re-sync keeps per-ROM children ([#888](https://github.com/danielcopper/decky-romm-sync/issues/888)) ([5b65fde](https://github.com/danielcopper/decky-romm-sync/commit/5b65fde7947e01598e14db2f6a3b359d43d6b16b)), closes [#887](https://github.com/danielcopper/decky-romm-sync/issues/887)
+* **saves:** allow null tracked_save_id for hash-only baselines ([#873](https://github.com/danielcopper/decky-romm-sync/issues/873)) ([7de822a](https://github.com/danielcopper/decky-romm-sync/commit/7de822af6fcb5bef64ebbcabdf8159d2a6e01f4d))
+* **saves:** register device with /etc/machine-id fingerprint ([#880](https://github.com/danielcopper/decky-romm-sync/issues/880)) ([494f73b](https://github.com/danielcopper/decky-romm-sync/commit/494f73be9ae274b5786f534b29e17ded738c5442))
+* **saves:** serialize StatusService save-status RMW under rom_lock ([#874](https://github.com/danielcopper/decky-romm-sync/issues/874)) ([86d4fc7](https://github.com/danielcopper/decky-romm-sync/commit/86d4fc7e349737e4ed747e0d4930ff8afe0efe71))
+* **types:** make @decky/ui + callable boundary types honest ([#858](https://github.com/danielcopper/decky-romm-sync/issues/858)) ([9f1e270](https://github.com/danielcopper/decky-romm-sync/commit/9f1e270561188e4d5a1951a5898985b5ceb59093))
+
+
+### Miscellaneous Chores
+
+* **persistence:** flag JSON→SQLite cutover as a breaking upgrade ([#913](https://github.com/danielcopper/decky-romm-sync/issues/913)) ([07e0665](https://github.com/danielcopper/decky-romm-sync/commit/07e06659f9ca5c95491591bb7ba9c6a8a6dc99ba))
+
 ## [0.19.0](https://github.com/danielcopper/decky-romm-sync/compare/decky-romm-sync-v0.18.0...decky-romm-sync-v0.19.0) (2026-05-24)
 
 
