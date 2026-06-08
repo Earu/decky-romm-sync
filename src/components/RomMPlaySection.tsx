@@ -92,6 +92,8 @@ interface InfoState {
   activeCoreLabel: string | null;
   activeCoreIsDefault: boolean;
   availableCores: Array<{ core_so: string; label: string; is_default: boolean }>;
+  platformCoreLabel: string | null;
+  hasGameOverride: boolean;
   activeSlot: string | null;
   raId: number | null;
   achievementEarned: number;
@@ -223,6 +225,8 @@ export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => { // NOS
     activeCoreLabel: null,
     activeCoreIsDefault: true,
     availableCores: [],
+    platformCoreLabel: null,
+    hasGameOverride: false,
     activeSlot: "default",
     raId: null,
     achievementEarned: 0,
@@ -759,7 +763,7 @@ export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => { // NOS
     try {
       const result = await clearGameCore(romId);
       detach(debugLog(`handleResetGameCore: result success=${result.success}`));
-      await applyCoreResult(result, romId, platformSlug, "Reverted to default");
+      await applyCoreResult(result, romId, platformSlug, "Now following the system core");
     } catch {
       toaster.toast({ title: "RomM Sync", body: "Failed to reset core" });
     }
@@ -776,22 +780,53 @@ export const RomMPlaySection: FC<RomMPlaySectionProps> = ({ appId }) => { // NOS
           "Switching cores may affect save compatibility",
         ),
         createElement(MenuSeparator, { key: "core-sep" }),
+        // "Use System Override" is the dedicated reset item: selecting it CLEARS
+        // the per-game pin so the game follows the per-platform/system core. The
+        // fallback label (the core the game falls back to with no pin) is the
+        // per-platform override when set, else the es_systems default. The
+        // checkmark sits here when there is NO per-game override — i.e. the
+        // game already follows the system. "System Override" deliberately
+        // differs from the "(default)" core marker so the menu never shows two
+        // "defaults" (#211).
+        (() => {
+          const defaultLabel = info.availableCores.find((c) => c.is_default)?.label;
+          const fallbackLabel = info.platformCoreLabel ?? defaultLabel ?? null;
+          const fallbackSuffix = fallbackLabel ? ` (${fallbackLabel})` : "";
+          // ✓ when the game already follows the system (no per-game pin).
+          const followsSystemMark = info.hasGameOverride ? "" : " ✓";
+          return createElement(
+            MenuItem,
+            {
+              key: "core-follow-system",
+              onClick: () => {
+                detach(handleResetGameCore());
+              },
+            },
+            `Use System Override${fallbackSuffix}${followsSystemMark}`,
+          );
+        })(),
+        createElement(MenuSeparator, { key: "core-follow-sep" }),
         ...info.availableCores.map((c) => {
           // The active marker sits on the ACTIVE core: the default-marked entry
           // when no override is pinned, otherwise the pinned core (#945).
           const isActive = info.activeCoreIsDefault ? c.is_default : info.activeCoreLabel === c.label;
+          // The (system) marker sits on the per-platform override set on the
+          // System page (settings.json platform_cores). A core can carry both
+          // "(default) (system)" and "(system) ✓" — all three roles are
+          // independent (#954).
+          const isPlatformCore = info.platformCoreLabel !== null && c.label === info.platformCoreLabel;
           return createElement(
             MenuItem,
             {
               key: `core-${c.core_so}`,
-              // Picking the default-marked core CLEARS the per-game override
-              // (follow default); any other core PINS it. The default entry is
-              // the reset path \u2014 there is no separate "Reset" item.
+              // Every core PINS the per-game override, including the
+              // default-marked one. The dedicated "Use System Override" item
+              // above is the only clear path (#211).
               onClick: () => {
-                detach(c.is_default ? handleResetGameCore() : handleChangeGameCore(c.label));
+                detach(handleChangeGameCore(c.label));
               },
             },
-            `${c.label}${c.is_default ? " (default)" : ""}${isActive ? " \u2713" : ""}`,
+            `${c.label}${c.is_default ? " (default)" : ""}${isPlatformCore ? " (system)" : ""}${isActive ? " \u2713" : ""}`,
           );
         }),
       ),

@@ -24,6 +24,8 @@ interface CoreState {
   activeCoreLabel: string | null;
   activeCoreIsDefault: boolean;
   availableCores: Array<{ core_so: string; label: string; is_default: boolean }>;
+  platformCoreLabel: string | null;
+  hasGameOverride: boolean;
   unrelated: string;
 }
 
@@ -229,6 +231,8 @@ describe("refreshCoreInfoInBackground", () => {
     vi.mocked(backend.getPlatformCoreInfo).mockResolvedValueOnce({
       active_core: "parallel_n64_libretro.so",
       active_core_label: "ParaLLEl N64",
+      platform_core_label: null,
+      has_game_override: false,
       cores: [
         { core_so: "mupen64plus_next_libretro.so", label: "Mupen64Plus-Next", is_default: true },
         { core_so: "parallel_n64_libretro.so", label: "ParaLLEl N64", is_default: false },
@@ -247,6 +251,8 @@ describe("refreshCoreInfoInBackground", () => {
       activeCoreLabel: null,
       activeCoreIsDefault: true,
       availableCores: [],
+      platformCoreLabel: null,
+      hasGameOverride: false,
       unrelated: "keep",
     });
     expect(next.activeCoreLabel).toBe("ParaLLEl N64");
@@ -260,6 +266,8 @@ describe("refreshCoreInfoInBackground", () => {
     vi.mocked(backend.getPlatformCoreInfo).mockResolvedValueOnce({
       active_core: null,
       active_core_label: null,
+      platform_core_label: null,
+      has_game_override: false,
       cores: [],
     });
     const setter = vi.fn();
@@ -279,7 +287,13 @@ describe("refreshCoreInfoInBackground", () => {
     refreshCoreInfoInBackground(404, () => cancelled, setter);
 
     cancelled = true;
-    d.resolve({ active_core: null, active_core_label: null, cores: [] });
+    d.resolve({
+      active_core: null,
+      active_core_label: null,
+      platform_core_label: null,
+      has_game_override: false,
+      cores: [],
+    });
     await flushMicrotasks();
 
     expect(setter).not.toHaveBeenCalled();

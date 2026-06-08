@@ -26,6 +26,8 @@ export interface CoreInfoFields {
   activeCoreLabel: string | null;
   activeCoreIsDefault: boolean;
   availableCores: AvailableCore[];
+  platformCoreLabel: string | null;
+  hasGameOverride: boolean;
 }
 
 export interface SaveSyncResolution {
@@ -86,6 +88,8 @@ export function extractCoreInfo(coreInfo: CoreInfo): CoreInfoFields {
     activeCoreLabel,
     activeCoreIsDefault,
     availableCores,
+    platformCoreLabel: coreInfo.platform_core_label ?? null,
+    hasGameOverride: coreInfo.has_game_override,
   };
 }
 
