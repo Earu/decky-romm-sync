@@ -8,6 +8,7 @@ import pytest
 
 # conftest.py patches decky before this import; use _make_testable_plugin for test-only attrs
 from conftest import _make_testable_plugin
+from fakes.fake_active_core_resolver import FakeActiveCoreResolver
 from fakes.fake_core_info_provider import FakeCoreInfoProvider
 from fakes.fake_migration_file_store import FakeMigrationFileStore
 from fakes.fake_retrodeck_paths import FakeRetroDeckPaths
@@ -93,11 +94,10 @@ def plugin(tmp_path, fake_romm_api):
             log_debug=p._log_debug,
             artwork=FakeArtworkManager(),
             uow_factory=FakeUnitOfWorkFactory(),
+            core_info=FakeCoreInfoProvider(),
+            resolve_system=lambda platform_slug, platform_fs_slug=None: platform_slug,
         ),
     )
-
-    def _no_active_core(system_name: str, rom_filename: str | None = None) -> tuple[str | None, str | None]:
-        return (None, None)
 
     def _no_core_name(core_so: str) -> str | None:
         return None
@@ -105,6 +105,9 @@ def plugin(tmp_path, fake_romm_api):
     def _default_save_sorting() -> tuple[bool, bool]:
         return (True, False)
 
+    # Shared core-info fake so a relaunch test can seed ``available_cores`` and
+    # assert a per-game emulator_override re-bakes the ``-e`` form post-move.
+    p._core_info = FakeCoreInfoProvider()
     p._migration_service = MigrationService(
         config=MigrationServiceConfig(
             migration_file_store=MigrationFileAdapter(),
@@ -116,8 +119,10 @@ def plugin(tmp_path, fake_romm_api):
             get_bios_files_index=lambda: p._firmware_service.bios_files_index,
             retrodeck_paths=FakeRetroDeckPaths(),
             get_retroarch_save_sorting=_default_save_sorting,
-            get_active_core=_no_active_core,
+            active_core=FakeActiveCoreResolver(default=(None, None)),
             get_core_name=_no_core_name,
+            core_info=p._core_info,
+            resolve_system=lambda platform_slug, platform_fs_slug=None: platform_slug,
             uow_factory=FakeUnitOfWorkFactory(uow=uow),
         ),
     )
@@ -1050,6 +1055,91 @@ class TestMigrationRelaunchOptions:
         assert old_rom not in payload["items"][0]["launch_options"]
 
     @pytest.mark.asyncio
+    async def test_relocated_rom_with_override_rebakes_e_form(self, plugin, tmp_path):
+        """A relocated ROM with a resolvable ``emulator_override`` re-bakes the ``-e`` form."""
+        import decky
+
+        decky.DECKY_USER_HOME = str(tmp_path)
+        plugin._persistence = PersistenceAdapter(str(tmp_path), str(tmp_path), decky.logger)
+        plugin._core_info.available_cores = [
+            {"core_so": "pcsx_rearmed_libretro", "label": "PCSX ReARMed", "is_default": True},
+        ]
+
+        old_home = str(tmp_path / "old")
+        new_home = str(tmp_path / "new")
+        old_rom = os.path.join(old_home, "roms", "psx", "game.chd")
+        new_rom = os.path.join(new_home, "roms", "psx", "game.chd")
+        os.makedirs(os.path.dirname(old_rom))
+        with open(old_rom, "w") as f:
+            f.write("rom data")
+
+        with plugin._uow as uow:
+            uow.kv_config.set("retrodeck_home_path_previous", old_home)
+            uow.kv_config.set("retrodeck_home_path", new_home)
+        _seed_install(plugin._uow, 1, file_path=old_rom, system="psx", platform_slug="psx", app_id=4242)
+        with plugin._uow as uow:
+            uow.roms.set_emulator_override(1, "PCSX ReARMed")
+
+        result = await plugin.migrate_retrodeck_files()
+        assert result["success"] is True
+
+        payload = self._relaunch_emit(plugin)
+        assert payload is not None
+        assert payload["items"] == [
+            {
+                "app_id": 4242,
+                "launch_options": (
+                    "flatpak run net.retrodeck.retrodeck "
+                    '-e "%EMULATOR_RETROARCH% -L /var/config/retroarch/cores/pcsx_rearmed_libretro.so %ROM%" '
+                    f'"{new_rom}"'
+                ),
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_relocated_rom_with_stale_override_rebakes_plain_and_warns(self, plugin, tmp_path, caplog):
+        """A stale override LABEL re-bakes the PLAIN launch + WARNs (B4) — never ``None.so``."""
+        import logging
+
+        import decky
+
+        decky.DECKY_USER_HOME = str(tmp_path)
+        plugin._persistence = PersistenceAdapter(str(tmp_path), str(tmp_path), decky.logger)
+        # available_cores does not carry the pinned label → resolution returns None.
+        plugin._core_info.available_cores = [
+            {"core_so": "pcsx_rearmed_libretro", "label": "PCSX ReARMed", "is_default": True},
+        ]
+
+        old_home = str(tmp_path / "old")
+        new_home = str(tmp_path / "new")
+        old_rom = os.path.join(old_home, "roms", "psx", "game.chd")
+        new_rom = os.path.join(new_home, "roms", "psx", "game.chd")
+        os.makedirs(os.path.dirname(old_rom))
+        with open(old_rom, "w") as f:
+            f.write("rom data")
+
+        with plugin._uow as uow:
+            uow.kv_config.set("retrodeck_home_path_previous", old_home)
+            uow.kv_config.set("retrodeck_home_path", new_home)
+        _seed_install(plugin._uow, 1, file_path=old_rom, system="psx", platform_slug="psx", app_id=4242)
+        with plugin._uow as uow:
+            uow.roms.set_emulator_override(1, "Removed Core")
+
+        with caplog.at_level(logging.WARNING):
+            result = await plugin.migrate_retrodeck_files()
+        assert result["success"] is True
+
+        payload = self._relaunch_emit(plugin)
+        assert payload is not None
+        # Stale → PLAIN launch at the NEW path, never -e None.so.
+        assert payload["items"] == [
+            {"app_id": 4242, "launch_options": f'flatpak run net.retrodeck.retrodeck "{new_rom}"'}
+        ]
+        assert "-e" not in payload["items"][0]["launch_options"]
+        assert "Removed Core" in caplog.text
+        assert "no longer resolves" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_installed_unbound_rom_excluded(self, plugin, tmp_path):
         """Edge: installed but UNBOUND (shortcut_app_id None) is excluded from items."""
         import decky
@@ -1376,8 +1466,10 @@ class TestMigrationFailureInjection:
             "get_bios_files_index": dict,
             "retrodeck_paths": FakeRetroDeckPaths(),
             "get_retroarch_save_sorting": lambda: (False, False),
-            "get_active_core": lambda system, rom_filename: (None, None),
+            "active_core": FakeActiveCoreResolver(default=(None, None)),
             "get_core_name": lambda core_so: None,
+            "core_info": FakeCoreInfoProvider(),
+            "resolve_system": lambda platform_slug, platform_fs_slug=None: platform_slug,
             "uow_factory": FakeUnitOfWorkFactory(uow=uow),
         }
         defaults.update(overrides)

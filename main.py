@@ -195,11 +195,15 @@ class Plugin:
         return await self._core_service.set_system_core(platform_slug, core_label)
 
     @migration_blocked
-    async def set_game_core(self, platform_slug, rom_path, core_label):
-        return await self._core_service.set_game_core(platform_slug, rom_path, core_label)
+    async def set_game_core(self, rom_id, label):
+        return await self._core_service.set_game_core(rom_id, label)
 
-    async def get_platform_core_info(self, platform_slug, rom_filename=None):
-        return await self._core_service.get_available_cores(platform_slug, rom_filename=rom_filename)
+    @migration_blocked
+    async def clear_game_core(self, rom_id):
+        return await self._core_service.clear_game_core(rom_id)
+
+    async def get_platform_core_info(self, rom_id):
+        return await self._core_service.get_available_cores(rom_id)
 
     # ── Firmware delegation to FirmwareService ──────────────
 
@@ -214,8 +218,10 @@ class Plugin:
     async def download_required_firmware(self, platform_slug):
         return await self._firmware_service.download_required_firmware(platform_slug)
 
-    async def check_platform_bios(self, platform_slug, rom_filename=None):
-        return await self._firmware_service.check_platform_bios(platform_slug, rom_filename=rom_filename)
+    async def check_platform_bios(self, platform_slug):
+        # Platform-level BIOS check (the frontend callable sends only the slug);
+        # no per-game core to thread, so the system default drives the filter.
+        return await self._firmware_service.check_platform_bios(platform_slug)
 
     async def get_bios_status(self, rom_id):
         return await self._game_detail_service.get_bios_status(rom_id)

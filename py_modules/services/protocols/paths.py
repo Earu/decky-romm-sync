@@ -4,8 +4,8 @@ Services query the host RetroDECK/RetroArch/ES-DE environment through
 these Protocols: filesystem path getters (saves, roms, BIOS,
 RetroDECK home), platform-to-system resolution, RetroArch save sorting
 toggles, and RetroArch core lookups for ES-DE configured systems.
-``GamelistXmlEditor`` is the matching write seam for ES-DE
-per-system / per-game core overrides — paired with ``CoreInfoProvider``
+``GamelistXmlEditor`` is the matching write seam for the ES-DE
+per-system core override — paired with ``CoreInfoProvider``
 which owns the read side.
 """
 
@@ -45,26 +45,25 @@ class RetroArchSaveSortingProvider(Protocol):
 
 
 class CoreResolverFn(Protocol):
-    """Resolve the active RetroArch core for a system/game."""
+    """Resolve the active RetroArch core for a system."""
 
-    def __call__(self, system_name: str, rom_filename: str | None = None) -> tuple[str | None, str | None]: ...
+    def __call__(self, system_name: str) -> tuple[str | None, str | None]: ...
 
 
 class CoreInfoProvider(Protocol):
     """Core resolution for ES-DE configured systems, consumed by services.
 
     Exposes the read seam services need to ask "which RetroArch core is
-    active for this system/ROM?" without depending on the concrete
-    adapter. Implementations own the underlying file reads and may
-    cache parse results; ``reset_cache`` lets writers invalidate the
-    cache after editing the underlying configuration.
+    active for this system?" without depending on the concrete adapter.
+    Resolution is system-layer only (per-system ``<alternativeEmulator>``
+    → es_systems default → ``core_defaults``); per-game core selection is
+    a ``roms`` store concern read through ``active_core_for_rom``.
+    Implementations own the underlying file reads and may cache parse
+    results; ``reset_cache`` lets writers invalidate the cache after
+    editing the underlying configuration.
     """
 
-    def get_active_core(
-        self,
-        system_name: str,
-        rom_filename: str | None = None,
-    ) -> tuple[str | None, str | None]: ...
+    def get_active_core(self, system_name: str) -> tuple[str | None, str | None]: ...
 
     def get_available_cores(self, system_name: str) -> list[dict[str, Any]]: ...
 
@@ -72,7 +71,7 @@ class CoreInfoProvider(Protocol):
 
 
 class GamelistXmlEditor(Protocol):
-    """Write seam for ES-DE per-system / per-game core overrides.
+    """Write seam for the ES-DE per-system core override.
 
     Lets ``main.py`` callables mutate ``gamelist.xml`` without
     depending on the concrete adapter. Reads remain a
@@ -83,14 +82,6 @@ class GamelistXmlEditor(Protocol):
         self,
         retrodeck_home: str,
         system_name: str,
-        core_label: str | None,
-    ) -> bool: ...
-
-    def set_game_override(
-        self,
-        retrodeck_home: str,
-        system_name: str,
-        rom_path: str,
         core_label: str | None,
     ) -> bool: ...
 

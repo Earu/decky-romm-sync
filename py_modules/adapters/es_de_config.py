@@ -2,7 +2,10 @@
 
 Owns the I/O for resolving active RetroArch cores from ES-DE's
 ``gamelist.xml`` / ``es_systems.xml`` / ``core_defaults.json``, and for
-writing per-system / per-game core overrides back to ``gamelist.xml``.
+writing the per-system core override back to ``gamelist.xml``. Both the
+read and write sides operate at the system layer only (per-system
+``<alternativeEmulator>`` → es_systems default → ``core_defaults``);
+per-game core selection lives in the ``roms`` store, not gamelist.
 """
 
 from __future__ import annotations
@@ -41,10 +44,10 @@ class CoreResolver:
     """Resolves active RetroArch cores for ES-DE systems.
 
     Reads ``es_systems.xml`` from the RetroDECK flatpak install, falls back
-    to a bundled ``core_defaults.json``, and honours per-system /
-    per-game overrides written into ``gamelist.xml``. Caches its file
-    reads as instance attributes; call :meth:`reset_cache` after editing
-    the underlying files.
+    to a bundled ``core_defaults.json``, and honours the per-system
+    ``<alternativeEmulator>`` override written into ``gamelist.xml``.
+    Caches its file reads as instance attributes; call :meth:`reset_cache`
+    after editing the underlying files.
 
     Implements the ``CoreInfoProvider`` Protocol structurally.
     """
@@ -94,8 +97,8 @@ class CoreResolver:
                 return (core_so, override_label)
         return None
 
-    def _try_gamelist_overrides(self, system_name, system_info, rom_filename):
-        """Try per-game and per-system overrides from gamelist.xml.
+    def _try_gamelist_overrides(self, system_name, system_info):
+        """Try the per-system override from gamelist.xml.
 
         Returns (core_so, label) or None.
         """
@@ -110,43 +113,27 @@ class CoreResolver:
         if not retrodeck_home:
             return None
 
-        # Per-game override (if rom_filename provided)
-        if rom_filename:
-            game_label = self._read_game_override(retrodeck_home, system_name, rom_filename)
-            if game_label:
-                resolved = self._resolve_label(system_name, system_info, game_label)
-                if resolved:
-                    self._logger.debug(
-                        "es_de_config: per-game override for %s/%s -> %s",
-                        system_name,
-                        rom_filename,
-                        game_label,
-                    )
-                    return resolved
-
-        # Per-system override
         override_label = self._read_system_override(retrodeck_home, system_name)
         if not override_label:
             return None
         return self._resolve_label(system_name, system_info, override_label)
 
-    def get_active_core(self, system_name, rom_filename=None):
-        """Resolve the active core for a system (or specific game).
+    def get_active_core(self, system_name):
+        """Resolve the active core for a system.
 
         Resolution chain:
-        1. Per-game override (gamelist.xml altemulator) — if rom_filename provided
-        2. Per-system override (gamelist.xml alternativeEmulator)
-        3. Live es_systems.xml default
-        4. Static core_defaults.json fallback
-        5. (None, None) if all fail
+        1. Per-system override (gamelist.xml alternativeEmulator)
+        2. Live es_systems.xml default
+        3. Static core_defaults.json fallback
+        4. (None, None) if all fail
 
         Returns: (core_so_name, label) or (None, None).
         """
         es_systems = self._load_es_systems()
         system_info = es_systems.get(system_name)
 
-        # Try gamelist.xml overrides first
-        override = self._try_gamelist_overrides(system_name, system_info, rom_filename)
+        # Try the system-level gamelist.xml override first
+        override = self._try_gamelist_overrides(system_name, system_info)
         if override:
             return override
 
@@ -260,38 +247,6 @@ class CoreResolver:
             return None
 
         return result["label"]
-
-    def _read_game_override(self, retrodeck_home, system_name, rom_filename):
-        """Check for per-game alternative emulator override in gamelist.xml.
-
-        Reads ``{retrodeck_home}/ES-DE/gamelists/{system}/gamelist.xml``
-        looking for ``<game>`` entries with matching ``<path>`` and ``<altemulator>``.
-
-        Returns the altemulator label string or None.
-        """
-        gamelist_path = os.path.join(retrodeck_home, "ES-DE", "gamelists", system_name, _GAMELIST_FILENAME)
-        if not os.path.exists(gamelist_path):
-            return None
-
-        raw = GamelistXmlEditorAdapter.read_gamelist_raw(gamelist_path)
-        if not raw:
-            return None
-
-        parsed = GamelistXmlEditorAdapter.parse_gamelist_preserving(raw)
-        if not parsed:
-            return None
-
-        # Match rom_filename against game paths
-        # rom_filename could be "Pokemon.gba" and path could be "./Pokemon.gba"
-        for game in parsed["games"]:
-            game_path = game.get("path", "")
-            # Normalize: strip leading "./" for comparison
-            normalized = game_path.lstrip("./") if game_path else ""
-            path_matches = normalized == rom_filename or game_path == rom_filename or game_path == f"./{rom_filename}"
-            if path_matches and game.get("altemulator"):
-                return game["altemulator"]
-
-        return None
 
     # -- static helpers (no instance state needed) ---------------------------
 
@@ -509,7 +464,7 @@ class CoreResolver:
 
 
 class GamelistXmlEditorAdapter:
-    """Writes per-system and per-game core overrides into ES-DE's gamelist.xml.
+    """Writes the per-system core override into ES-DE's gamelist.xml.
 
     Implements ``GamelistXmlEditor`` Protocol structurally. Reads
     happen through :class:`CoreResolver`; this class only writes.
@@ -545,53 +500,6 @@ class GamelistXmlEditorAdapter:
         self.write_gamelist_atomic(path, content)
         action = "cleared" if not core_label else f"set to '{core_label}'"
         self._logger.info("es_de_config: system override for %s %s (%s)", system_name, action, path)
-        return True
-
-    def set_game_override(self, retrodeck_home, system_name, rom_path, core_label):
-        """Set or clear per-game core override in gamelist.xml.
-
-        ``rom_path`` is the relative path for the game (e.g.
-        ``"./Pokemon.gba"``). If ``core_label`` is None/empty, removes
-        the ``altemulator`` from the game entry. Creates the game entry
-        if not found. Preserves all other content.
-        """
-        path = self.gamelist_path(retrodeck_home, system_name)
-        raw = self.read_gamelist_raw(path)
-
-        if raw:
-            parsed = self.parse_gamelist_preserving(raw)
-            if parsed is None:
-                self._logger.warning("es_de_config: failed to parse %s for writing", path)
-                return False
-            alt_label = parsed["alt_emulator_label"]
-            games = parsed["games"]
-        else:
-            alt_label = None
-            games = []
-
-        # Find or create the game entry
-        found = False
-        new_games_xml = []
-        for game in games:
-            if game["path"] == rom_path:
-                found = True
-                # Rebuild this game entry with updated altemulator
-                new_games_xml.append(self.rebuild_game_xml(game["raw_xml"], core_label))
-            else:
-                new_games_xml.append(game["raw_xml"])
-
-        if not found and core_label:
-            escaped_path = self.escape_xml(rom_path)
-            escaped_label = self.escape_xml(core_label)
-            game_xml = (
-                f"<game>\n    <path>{escaped_path}</path>\n    <altemulator>{escaped_label}</altemulator>\n  </game>"
-            )
-            new_games_xml.append(game_xml)
-
-        content = self.reconstruct_gamelist(alt_label, new_games_xml)
-        self.write_gamelist_atomic(path, content)
-        action = "cleared" if not core_label else f"set to '{core_label}'"
-        self._logger.info("es_de_config: game override for %s [%s] %s (%s)", system_name, rom_path, action, path)
         return True
 
     # -- internal helpers (static, used by CoreResolver too) -----------------
@@ -751,86 +659,4 @@ class GamelistXmlEditorAdapter:
             parts.append(f"\n  <alternativeEmulator>\n    <label>{escaped}</label>\n  </alternativeEmulator>")
         parts.extend(f"\n  {game_xml}" for game_xml in games_xml_list)
         parts.append("\n</gameList>\n")
-        return "".join(parts)
-
-    @staticmethod
-    def _rebuild_start_handler(state, elements):
-        """Create a start_element handler for rebuild_game_xml."""
-
-        def start_element(name, attrs):
-            state["path"].append(name)
-            state["text"] = ""
-            if name == "altemulator":
-                state["skip_altemulator"] = True
-                return
-            if state["skip_altemulator"] or name == "game":
-                return
-            attr_str = GamelistXmlEditorAdapter._build_attr_str(attrs)
-            elements.append(("open", f"<{name}{attr_str}>"))
-
-        return start_element
-
-    @staticmethod
-    def _rebuild_end_handler(state, elements):
-        """Create an end_element handler for rebuild_game_xml."""
-
-        def end_element(name):
-            if name == "altemulator":
-                state["skip_altemulator"] = False
-                state["path"].pop()
-                state["text"] = ""
-                return
-            if state["skip_altemulator"]:
-                state["path"].pop()
-                state["text"] = ""
-                return
-            if name == "game" and len(state["path"]) == 1:
-                state["path"].pop()
-                state["text"] = ""
-                return
-            if state["text"]:
-                elements.append(("text", GamelistXmlEditorAdapter.escape_xml(state["text"])))
-            elements.append(("close", f"</{name}>"))
-            state["path"].pop()
-            state["text"] = ""
-
-        return end_element
-
-    @staticmethod
-    def rebuild_game_xml(raw_xml, core_label):
-        """Rebuild a ``<game>`` XML string with updated ``<altemulator>`` value.
-
-        If ``core_label`` is ``None``/empty, removes ``<altemulator>``
-        entirely. Preserves all other child elements.
-        """
-        try:
-            from xml.parsers import expat
-        except ImportError:
-            return raw_xml
-
-        elements: list[tuple[str, str]] = []
-        state = {"path": [], "text": "", "skip_altemulator": False}
-
-        parser = expat.ParserCreate()
-        parser.StartElementHandler = GamelistXmlEditorAdapter._rebuild_start_handler(state, elements)
-        parser.EndElementHandler = GamelistXmlEditorAdapter._rebuild_end_handler(state, elements)
-
-        def char_data(data):
-            if not state["skip_altemulator"]:
-                state["text"] += data
-
-        parser.CharacterDataHandler = char_data
-
-        try:
-            parser.Parse(raw_xml.encode("utf-8"), True)
-        except expat.ExpatError:
-            return raw_xml  # fallback: return unchanged
-
-        # Reconstruct
-        parts = ["<game>"]
-        for _, data in elements:
-            parts.append(data)
-        if core_label:
-            parts.append(f"<altemulator>{GamelistXmlEditorAdapter.escape_xml(core_label)}</altemulator>")
-        parts.append("</game>")
         return "".join(parts)

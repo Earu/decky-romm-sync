@@ -107,6 +107,15 @@ vi.mock("../utils/cachedGameDetailStore", () => ({
   invalidateCachedGameDetail: vi.fn(),
 }));
 
+// ----- steamShortcuts — the set/clear core apply flow confirms the re-baked
+// launch_options landed via setLaunchOptionsConfirmed (the fire-then-poll
+// helper). Mock it so tests drive the confirmed (true) / unconfirmed (false)
+// branches without touching the real RegisterForAppDetails poll. -----
+vi.mock("../utils/steamShortcuts", () => ({
+  setLaunchOptionsConfirmed: vi.fn(),
+}));
+import { setLaunchOptionsConfirmed } from "../utils/steamShortcuts";
+
 // ----- metadataPatches.updatePlaytimeDisplay — the overview write-chokepoint.
 // Mock it so the reconcile-on-view test can assert the reconciled total is
 // pushed through, and so we control whether the romm_playtime_changed signal
@@ -257,7 +266,7 @@ describe("RomMPlaySection", () => {
     // mock result into state so the core button / menu render as in production,
     // where the dedicated core-info path (#923) populates these fields. The
     // extractCoreInfo mock ignores its argument, so the dummy CoreInfo is fine.
-    vi.mocked(sectionRefresh.refreshCoreInfoInBackground).mockImplementation((_slug, _romFile, cancelled, setter) => {
+    vi.mocked(sectionRefresh.refreshCoreInfoInBackground).mockImplementation((_romId, cancelled, setter) => {
       if (cancelled()) return;
       const coreFields = playSectionUtils.extractCoreInfo({ cores: [], active_core: null, active_core_label: null });
       act(() => {
@@ -266,6 +275,9 @@ describe("RomMPlaySection", () => {
     });
     vi.mocked(playSectionUtils.resolveSaveSyncLabel).mockReturnValue("synced label");
     vi.mocked(playSectionUtils.timeoutMs).mockImplementation(() => new Promise(() => {}));
+    // Default: the re-baked launch_options confirm-set succeeds. Tests opt into
+    // the unconfirmed (false) branch per case.
+    vi.mocked(setLaunchOptionsConfirmed).mockResolvedValue(true);
     // Default core-info path — empty cores. Tests opt into specific shapes.
     vi.mocked(backend.getPlatformCoreInfo).mockResolvedValue({
       cores: [],
@@ -427,12 +439,11 @@ describe("RomMPlaySection", () => {
         expect.any(Function),
         expect.any(Function),
       );
-      // Core info is fetched from its own path (#923), keyed on the platform slug
-      // AND the ROM filename (per-game override read-back, #936), independent of
-      // the BIOS refresh.
+      // Core info is fetched from its own path (#923), keyed on the rom_id so
+      // the active core reflects a per-game DB override (epic #945), independent
+      // of the BIOS refresh.
       expect(sectionRefresh.refreshCoreInfoInBackground).toHaveBeenCalledWith(
-        "snes",
-        "test.sfc",
+        99,
         expect.any(Function),
         expect.any(Function),
       );
@@ -1047,15 +1058,12 @@ describe("RomMPlaySection", () => {
       vi.mocked(cachedStore.getCachedGameDetail).mockResolvedValue({
         found: true,
         rom_id: 60,
-        // The ROM filename is mirrored into romFileRef on load and forwarded to
-        // the per-game core read-back (#936).
-        rom_file: "mario.sfc",
       });
       render(<RomMPlaySection appId={testAppId} />);
       await flushAsync();
 
-      // Core data comes from the dedicated path (#923), keyed on the event slug
-      // AND the ROM filename (per-game override read-back, #936).
+      // Core data comes from the dedicated path (#923), keyed on the rom_id so
+      // the active core reflects a per-game DB override (epic #945).
       vi.mocked(backend.getPlatformCoreInfo).mockResolvedValue({
         active_core: "blastem.so",
         active_core_label: "BlastEm",
@@ -1086,8 +1094,8 @@ describe("RomMPlaySection", () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      // The bare basename (sourced from romFileRef, not the event) is forwarded.
-      expect(vi.mocked(backend.getPlatformCoreInfo)).toHaveBeenCalledWith("snes", "mario.sfc");
+      // Keyed on rom_id (#945), not the event slug + filename.
+      expect(vi.mocked(backend.getPlatformCoreInfo)).toHaveBeenCalledWith(60);
       expect(vi.mocked(backend.getBiosStatus)).toHaveBeenCalledWith(60);
     });
 
@@ -2032,18 +2040,17 @@ describe("RomMPlaySection", () => {
       });
     }
 
-    it("happy path: setGameCore + getPlatformCoreInfo + cache invalidate + dispatches core_changed", async () => {
+    // Core menu (after the #945 reset-item removal): [compat(disabled), Snes9x
+    // (default), BlastEm] — the separator is filtered out by isMenuItem, and the
+    // explicit Reset item is gone (picking the default core clears the override).
+    const BLASTEM_IDX = 2;
+
+    it("happy path: setGameCore(rom_id, label) → confirms re-baked launch_options, toasts, invalidates + dispatches core_changed", async () => {
       await setupCoreAction();
       vi.mocked(backend.setGameCore).mockResolvedValue({
         success: true,
-        message: "ok",
-        // bios_status from set_game_core no longer carries core fields (#923).
-        bios_status: {
-          needs_bios: false,
-          server_count: 0,
-          local_count: 0,
-          all_downloaded: true,
-        },
+        launch_options: 'flatpak run net.retrodeck.retrodeck -e "...blastem.so..." "/roms/mario.sfc"',
+        app_id: 777,
       });
       vi.mocked(backend.getBiosStatus).mockResolvedValue({
         bios_status: null,
@@ -2053,22 +2060,25 @@ describe("RomMPlaySection", () => {
       render(<RomMPlaySection appId={testAppId} />);
       await flushAsync();
 
-      // Click the core button to open the core menu. Find core button via title.
       const coreItems = await openCoreMenuAndGetItems(testAppId);
       vi.mocked(toaster.toast).mockClear();
       vi.mocked(backend.getPlatformCoreInfo).mockClear();
       const listener = vi.fn();
       globalThis.addEventListener("romm_data_changed", listener);
       try {
-        // coreItems = [info1 (disabled), info2 (disabled), Snes9x, BlastEm]
-        const blastEm = coreItems[3]!;
         await act(async () => {
-          await blastEm.props.onClick?.();
+          await coreItems[BLASTEM_IDX]!.props.onClick?.();
         });
-        expect(vi.mocked(backend.setGameCore)).toHaveBeenCalledWith("snes", "./mario.sfc", "BlastEm");
-        // Core display refreshed via the dedicated path, not the BIOS payload (#923).
-        // The bare basename is forwarded so the per-game override reads back (#936).
-        expect(vi.mocked(backend.getPlatformCoreInfo)).toHaveBeenCalledWith("snes", "mario.sfc");
+        // Keyed by rom_id + label (#945) — no platform_slug/romPath args.
+        expect(vi.mocked(backend.setGameCore)).toHaveBeenCalledWith(42, "BlastEm");
+        // The re-baked launch_options is confirm-set on the bound shortcut BEFORE
+        // toasting success (R1).
+        expect(vi.mocked(setLaunchOptionsConfirmed)).toHaveBeenCalledWith(
+          777,
+          'flatpak run net.retrodeck.retrodeck -e "...blastem.so..." "/roms/mario.sfc"',
+        );
+        // Core display refreshed via the dedicated rom_id path (#923/#945).
+        expect(vi.mocked(backend.getPlatformCoreInfo)).toHaveBeenCalledWith(42);
         expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Core set to BlastEm" }));
         expect(vi.mocked(cachedStore.invalidateCachedGameDetail)).toHaveBeenCalledWith(testAppId);
         const ev = listener.mock.calls.map((c) => c[0] as CustomEvent).find((e) => e.detail.type === "core_changed");
@@ -2081,34 +2091,85 @@ describe("RomMPlaySection", () => {
       }
     });
 
-    it("setGameCore failure → toasts result.message", async () => {
+    // R1 — the silent-success guard. An unconfirmed bake must NOT toast success;
+    // it shows the DISTINCT "restart Steam" toast and keeps the DB row.
+    it("false-confirm: launch_options set but setLaunchOptionsConfirmed → false yields the DISTINCT restart toast, NOT success", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.setGameCore).mockResolvedValue({
+        success: true,
+        launch_options: 'flatpak run net.retrodeck.retrodeck -e "...blastem.so..." "/roms/mario.sfc"',
+        app_id: 777,
+      });
+      // The confirm poll never sees the read-back match → false.
+      vi.mocked(setLaunchOptionsConfirmed).mockResolvedValue(false);
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      vi.mocked(cachedStore.invalidateCachedGameDetail).mockClear();
+      await act(async () => {
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
+      });
+      // Post-confirm state (non-vacuous): the DISTINCT restart toast fired …
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(
+        expect.objectContaining({ body: "Core saved — restart Steam to apply" }),
+      );
+      // … and the success toast did NOT.
+      expect(vi.mocked(toaster.toast)).not.toHaveBeenCalledWith(
+        expect.objectContaining({ body: "Core set to BlastEm" }),
+      );
+      // The DB row is kept; no cache invalidate / refresh happens on the
+      // unconfirmed branch (re-sync/migration re-bake from the pin).
+      expect(vi.mocked(cachedStore.invalidateCachedGameDetail)).not.toHaveBeenCalled();
+    });
+
+    // Uninstalled/unbound: backend persists the pin but returns no launch_options
+    // / app_id → no SetAppLaunchOptions, still toasts the saved state.
+    it("uninstalled/unbound: success without launch_options/app_id → success toast, no confirm-set", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.setGameCore).mockResolvedValue({ success: true });
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(setLaunchOptionsConfirmed)).not.toHaveBeenCalled();
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Core set to BlastEm" }));
+    });
+
+    it("core_unavailable: {success:false} → toasts result.message", async () => {
       await setupCoreAction();
       vi.mocked(backend.setGameCore).mockResolvedValue({
         success: false,
-        message: "unsupported core",
+        reason: "core_unavailable",
+        message: "Core BlastEm not available for snes",
       });
       render(<RomMPlaySection appId={testAppId} />);
       await flushAsync();
       const coreItems = await openCoreMenuAndGetItems(testAppId);
       vi.mocked(toaster.toast).mockClear();
       await act(async () => {
-        await coreItems[3]!.props.onClick?.();
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
       });
-      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "unsupported core" }));
+      expect(vi.mocked(setLaunchOptionsConfirmed)).not.toHaveBeenCalled();
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(
+        expect.objectContaining({ body: "Core BlastEm not available for snes" }),
+      );
     });
 
     it("setGameCore failure with empty message → 'Failed to set core'", async () => {
       await setupCoreAction();
       vi.mocked(backend.setGameCore).mockResolvedValue({
         success: false,
-        message: "",
       });
       render(<RomMPlaySection appId={testAppId} />);
       await flushAsync();
       const coreItems = await openCoreMenuAndGetItems(testAppId);
       vi.mocked(toaster.toast).mockClear();
       await act(async () => {
-        await coreItems[3]!.props.onClick?.();
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
       });
       expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Failed to set core" }));
     });
@@ -2121,12 +2182,33 @@ describe("RomMPlaySection", () => {
       const coreItems = await openCoreMenuAndGetItems(testAppId);
       vi.mocked(toaster.toast).mockClear();
       await act(async () => {
-        await coreItems[3]!.props.onClick?.();
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
       });
       expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Failed to set core" }));
     });
 
-    it("missing platformSlug or romFile → no-op", async () => {
+    // Regression guard (#945): a successful set with a valid rom_id must NOT
+    // silently no-op — it must reach the confirm + success toast.
+    it("does NOT silently no-op: a valid rom_id drives the confirm + success toast", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.setGameCore).mockResolvedValue({
+        success: true,
+        launch_options: "lo",
+        app_id: 5,
+      });
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[BLASTEM_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(backend.setGameCore)).toHaveBeenCalledWith(42, "BlastEm");
+      expect(vi.mocked(setLaunchOptionsConfirmed)).toHaveBeenCalledWith(5, "lo");
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Core set to BlastEm" }));
+    });
+
+    it("missing romId or platformSlug → no-op", async () => {
       vi.mocked(cachedStore.getCachedGameDetail).mockResolvedValue({
         found: true,
         rom_id: 42,
@@ -2138,6 +2220,164 @@ describe("RomMPlaySection", () => {
       // Can't open the core menu because availableCores is empty → core button doesn't render.
       // Verify setGameCore is never called via direct dispatch.
       expect(vi.mocked(backend.setGameCore)).not.toHaveBeenCalled();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // M2. handleResetGameCore — triggered by picking the default-marked core
+  // (the explicit "Reset" item is gone; the default entry is the clear path)
+  // ------------------------------------------------------------------
+
+  describe("handleResetGameCore (picking the default-marked core)", () => {
+    async function setupCoreAction() {
+      vi.mocked(cachedStore.getCachedGameDetail).mockResolvedValue({
+        found: true,
+        rom_id: 42,
+        platform_slug: "snes",
+        rom_file: "mario.sfc",
+        bios_status: {
+          platform_slug: "snes",
+          server_count: 0,
+          local_count: 0,
+          all_downloaded: true,
+        },
+        bios_level: "ok",
+        bios_label: "OK",
+      });
+      vi.mocked(playSectionUtils.extractBiosInfo).mockReturnValue({
+        biosNeeded: true,
+        biosStatus: "ok",
+        biosLabel: "OK",
+      });
+      vi.mocked(backend.getPlatformCoreInfo).mockResolvedValue({
+        active_core: "blastem.so",
+        active_core_label: "BlastEm",
+        cores: [
+          { core_so: "snes9x.so", label: "Snes9x", is_default: true },
+          { core_so: "blastem.so", label: "BlastEm", is_default: false },
+        ],
+      });
+      // A non-default core is active, so picking the default-marked core clears it.
+      vi.mocked(playSectionUtils.extractCoreInfo).mockReturnValue({
+        activeCoreLabel: "BlastEm",
+        activeCoreIsDefault: false,
+        availableCores: [
+          { core_so: "snes9x.so", label: "Snes9x", is_default: true },
+          { core_so: "blastem.so", label: "BlastEm", is_default: false },
+        ],
+      });
+    }
+
+    // Picking the default-marked core (Snes9x) is the clear path. Menu after the
+    // #945 reset-item removal: [compat(disabled), Snes9x (default), BlastEm].
+    const DEFAULT_CORE_IDX = 1;
+
+    it("picking the default-marked core calls clearGameCore(rom_id) + confirms the PLAIN launch_options + toasts 'Reverted to default'", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.clearGameCore).mockResolvedValue({
+        success: true,
+        launch_options: 'flatpak run net.retrodeck.retrodeck "/roms/mario.sfc"',
+        app_id: 888,
+      });
+      vi.mocked(backend.getBiosStatus).mockResolvedValue({
+        bios_status: null,
+        bios_level: null,
+        bios_label: null,
+      });
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      // The default-marked core entry is the clear path (no separate Reset item).
+      // In this setup a non-default core (BlastEm) is active, so the ✓ sits on
+      // BlastEm — the default entry has no ✓ but still clears the override.
+      expect(coreItems[DEFAULT_CORE_IDX]!.props.children).toBe("Snes9x (default)");
+      vi.mocked(toaster.toast).mockClear();
+      vi.mocked(backend.getPlatformCoreInfo).mockClear();
+      const listener = vi.fn();
+      globalThis.addEventListener("romm_data_changed", listener);
+      try {
+        await act(async () => {
+          await coreItems[DEFAULT_CORE_IDX]!.props.onClick?.();
+        });
+        expect(vi.mocked(backend.clearGameCore)).toHaveBeenCalledWith(42);
+        // Picking a core entry must NOT have been used to clear.
+        expect(vi.mocked(backend.setGameCore)).not.toHaveBeenCalled();
+        // The PLAIN (no -e) launch_options is confirm-set on the bound shortcut.
+        expect(vi.mocked(setLaunchOptionsConfirmed)).toHaveBeenCalledWith(
+          888,
+          'flatpak run net.retrodeck.retrodeck "/roms/mario.sfc"',
+        );
+        expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Reverted to default" }));
+        expect(vi.mocked(backend.getPlatformCoreInfo)).toHaveBeenCalledWith(42);
+        expect(vi.mocked(cachedStore.invalidateCachedGameDetail)).toHaveBeenCalledWith(testAppId);
+        const ev = listener.mock.calls.map((c) => c[0] as CustomEvent).find((e) => e.detail.type === "core_changed");
+        expect(ev?.detail).toMatchObject({ type: "core_changed", platform_slug: "snes" });
+      } finally {
+        globalThis.removeEventListener("romm_data_changed", listener);
+      }
+    });
+
+    it("default-pick false-confirm → DISTINCT restart toast, NOT success", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.clearGameCore).mockResolvedValue({
+        success: true,
+        launch_options: 'flatpak run net.retrodeck.retrodeck "/roms/mario.sfc"',
+        app_id: 888,
+      });
+      vi.mocked(setLaunchOptionsConfirmed).mockResolvedValue(false);
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[DEFAULT_CORE_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(
+        expect.objectContaining({ body: "Core saved — restart Steam to apply" }),
+      );
+      expect(vi.mocked(toaster.toast)).not.toHaveBeenCalledWith(
+        expect.objectContaining({ body: "Reverted to default" }),
+      );
+    });
+
+    it("default-pick uninstalled/unbound: success without launch_options/app_id → success toast, no confirm-set", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.clearGameCore).mockResolvedValue({ success: true });
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[DEFAULT_CORE_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(setLaunchOptionsConfirmed)).not.toHaveBeenCalled();
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Reverted to default" }));
+    });
+
+    it("default-pick {success:false} → toasts result.message", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.clearGameCore).mockResolvedValue({ success: false, message: "clear failed" });
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[DEFAULT_CORE_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "clear failed" }));
+    });
+
+    it("default-pick throw → 'Failed to reset core'", async () => {
+      await setupCoreAction();
+      vi.mocked(backend.clearGameCore).mockRejectedValue(new Error("boom"));
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      const coreItems = await openCoreMenuAndGetItems(testAppId);
+      vi.mocked(toaster.toast).mockClear();
+      await act(async () => {
+        await coreItems[DEFAULT_CORE_IDX]!.props.onClick?.();
+      });
+      expect(vi.mocked(toaster.toast)).toHaveBeenCalledWith(expect.objectContaining({ body: "Failed to reset core" }));
     });
   });
 
@@ -2160,7 +2400,7 @@ describe("RomMPlaySection", () => {
       expect(destructive).toHaveLength(2);
     });
 
-    it("showCoreMenu yields 2 disabled info items + 1 MenuItem per available core (label shows '(default)' and '✓')", async () => {
+    async function setupCoreMenuStructure(extractCore: ReturnType<typeof playSectionUtils.extractCoreInfo>) {
       vi.mocked(cachedStore.getCachedGameDetail).mockResolvedValue({
         found: true,
         rom_id: 42,
@@ -2180,8 +2420,16 @@ describe("RomMPlaySection", () => {
         biosStatus: "ok",
         biosLabel: "OK",
       });
-      // Core list / active core now come from the dedicated path (#923).
-      vi.mocked(playSectionUtils.extractCoreInfo).mockReturnValue({
+      vi.mocked(playSectionUtils.extractCoreInfo).mockReturnValue(extractCore);
+      render(<RomMPlaySection appId={testAppId} />);
+      await flushAsync();
+      return openCoreMenuAndGetItems(testAppId);
+    }
+
+    it("showCoreMenu yields the compat note + 1 MenuItem per core (no separate Reset item); ✓ on the default core when it is active (#945)", async () => {
+      // Default core active → the override is NOT pinned, so the ✓ sits on the
+      // default-marked core entry (which is also the clear path).
+      const items = await setupCoreMenuStructure({
         activeCoreLabel: "Snes9x",
         activeCoreIsDefault: true,
         availableCores: [
@@ -2189,17 +2437,30 @@ describe("RomMPlaySection", () => {
           { core_so: "blastem.so", label: "BlastEm", is_default: false },
         ],
       });
-      render(<RomMPlaySection appId={testAppId} />);
-      await flushAsync();
-      const items = await openCoreMenuAndGetItems(testAppId);
-      // 2 disabled info items + 2 core items
-      expect(items).toHaveLength(4);
+      // 1 disabled compat note + 2 core items (separator filtered out, no Reset).
+      expect(items).toHaveLength(3);
+      // The obsolete RetroDECK-bug warning MenuItem is gone — only ONE disabled item.
+      expect(items.filter((i) => i.props.disabled === true)).toHaveLength(1);
       expect(items[0]!.props.disabled).toBe(true);
-      expect(items[1]!.props.disabled).toBe(true);
-      // Snes9x: " (default) ✓"
-      expect(items[2]!.props.children).toBe("Snes9x (default) ✓");
-      // BlastEm: no suffix beyond label
-      expect(items[3]!.props.children).toBe("BlastEm");
+      // The default-marked core carries the ✓ because it is active.
+      expect(items[1]!.props.children).toBe("Snes9x (default) ✓");
+      expect(items[2]!.props.children).toBe("BlastEm");
+    });
+
+    it("showCoreMenu marks the pinned non-default core with ✓ (not the default entry) (#945)", async () => {
+      const items = await setupCoreMenuStructure({
+        activeCoreLabel: "BlastEm",
+        activeCoreIsDefault: false,
+        availableCores: [
+          { core_so: "snes9x.so", label: "Snes9x", is_default: true },
+          { core_so: "blastem.so", label: "BlastEm", is_default: false },
+        ],
+      });
+      expect(items).toHaveLength(3);
+      // The default entry has no ✓ when an override is pinned …
+      expect(items[1]!.props.children).toBe("Snes9x (default)");
+      // … and the pinned core carries it instead.
+      expect(items[2]!.props.children).toBe("BlastEm ✓");
     });
 
     it("showSteamMenu Properties → SteamClient.Apps.OpenAppSettingsDialog(appId, 'general')", async () => {
@@ -2429,6 +2690,7 @@ async function openCoreMenuAndGetItems(_appId: number): Promise<MenuItemElement[
   const calls = vi.mocked(showContextMenu).mock.calls;
   const el = calls[calls.length - 1]?.[0] as ReactElement | undefined;
   if (!el) throw new Error("No context menu shown");
-  // Core menu has: 2 disabled info MenuItems + separator + N core MenuItems.
+  // Core menu has: 1 disabled compat note + separator + Reset MenuItem + N core
+  // MenuItems (the separator is dropped by isMenuItem). (#945)
   return getMenuItemsFromElement(el).filter(isMenuItem);
 }

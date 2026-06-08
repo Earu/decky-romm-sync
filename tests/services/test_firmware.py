@@ -146,6 +146,8 @@ def plugin():
             log_debug=p._log_debug,
             artwork=FakeArtworkManager(),
             uow_factory=FakeUnitOfWorkFactory(),
+            core_info=FakeCoreInfoProvider(),
+            resolve_system=lambda platform_slug, platform_fs_slug=None: platform_slug,
         ),
     )
     return p
@@ -278,8 +280,8 @@ class TestGetFirmwareStatus:
         from unittest.mock import AsyncMock, MagicMock
 
         core_info = FakeCoreInfoProvider(
-            active_core=("flycast_libretro.so", "Flycast"),
-            available_cores=[{"label": "Flycast", "so": "flycast_libretro.so"}],
+            active_core=("flycast_libretro", "Flycast"),
+            available_cores=[{"label": "Flycast", "so": "flycast_libretro"}],
         )
         resolver = FakeSystemResolver(mapping={"dc": "dreamcast"})
         fw = _make_firmware_service(core_info=core_info, resolve_system=resolver)
@@ -302,10 +304,10 @@ class TestGetFirmwareStatus:
         # Entry identity stays on the RAW slug.
         assert dc_plat["platform_slug"] == "dc"
         # Active-core data resolved under the NORMALIZED system surfaces on the entry.
-        assert dc_plat["active_core"] == "flycast_libretro.so"
-        assert dc_plat["available_cores"] == [{"label": "Flycast", "so": "flycast_libretro.so"}]
+        assert dc_plat["active_core"] == "flycast_libretro"
+        assert dc_plat["available_cores"] == [{"label": "Flycast", "so": "flycast_libretro"}]
         # Both core read seams received the NORMALIZED system, not the raw slug.
-        assert core_info.active_core_calls == [("dreamcast", None)]
+        assert core_info.active_core_calls == ["dreamcast"]
         assert core_info.available_cores_calls == ["dreamcast"]
         assert resolver.calls == [("dc", None)]
 
@@ -510,7 +512,7 @@ class TestDeletePlatformBios:
         )
 
         # Mock check_platform_bios with the REAL output shape: asdict dicts.
-        async def mock_check(slug, rom_filename=None):
+        async def mock_check(slug, active_core_so=None):
             return {
                 "needs_bios": True,
                 "server_count": 1,
@@ -620,7 +622,7 @@ class TestDeletePlatformBios:
     async def test_delete_platform_bios_no_files(self, fw):
         """Deleting BIOS when none exist returns success with 0."""
 
-        async def mock_check(slug, rom_filename=None):
+        async def mock_check(slug, active_core_so=None):
             return {"needs_bios": False}
 
         fw.check_platform_bios = mock_check
@@ -633,7 +635,7 @@ class TestDeletePlatformBios:
     async def test_delete_platform_bios_skips_not_downloaded(self, fw, tmp_path):
         """Only files with downloaded=True are deleted (real asdict dict shape)."""
 
-        async def mock_check(slug, rom_filename=None):
+        async def mock_check(slug, active_core_so=None):
             return {
                 "needs_bios": True,
                 "server_count": 2,
@@ -1091,8 +1093,8 @@ class TestCheckPlatformBiosSlugNormalization:
         from unittest.mock import AsyncMock, MagicMock
 
         core_info = FakeCoreInfoProvider(
-            active_core=("flycast_libretro.so", "Flycast"),
-            available_cores=[{"label": "Flycast", "so": "flycast_libretro.so"}],
+            active_core=("flycast_libretro", "Flycast"),
+            available_cores=[{"label": "Flycast", "so": "flycast_libretro"}],
         )
         resolver = FakeSystemResolver(mapping={"dc": "dreamcast", "sms": "mastersystem", "neo-geo-pocket": "ngp"})
         fw = _make_firmware_service(core_info=core_info, resolve_system=resolver)
@@ -1118,7 +1120,7 @@ class TestCheckPlatformBiosSlugNormalization:
         assert result["needs_bios"] is True
         assert result["server_count"] == 1
         # The active-core read seam received the NORMALIZED system.
-        assert core_info.active_core_calls == [(system, None)]
+        assert core_info.active_core_calls == [system]
         # The BIOS path no longer reads available cores at all.
         assert core_info.available_cores_calls == []
         assert resolver.calls == [(slug, None)]
@@ -1139,10 +1141,10 @@ class TestCheckPlatformBiosNoCoreFields:
         from unittest.mock import AsyncMock, MagicMock
 
         core_info = FakeCoreInfoProvider(
-            active_core=("genesisplusgx_libretro.so", "Genesis Plus GX"),
+            active_core=("genesisplusgx_libretro", "Genesis Plus GX"),
             available_cores=[
-                {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro.so"},
-                {"label": "PicoDrive", "so": "picodrive_libretro.so"},
+                {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro"},
+                {"label": "PicoDrive", "so": "picodrive_libretro"},
             ],
         )
         fw = _make_firmware_service(core_info=core_info)
@@ -1167,10 +1169,10 @@ class TestCheckPlatformBiosNoCoreFields:
     async def test_offline_no_registry_omits_core_fields(self, plugin, fw):
         """Server unreachable + no registry entries → no core fields."""
         core_info = FakeCoreInfoProvider(
-            active_core=("genesisplusgx_libretro.so", "Genesis Plus GX"),
+            active_core=("genesisplusgx_libretro", "Genesis Plus GX"),
             available_cores=[
-                {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro.so"},
-                {"label": "PicoDrive", "so": "picodrive_libretro.so"},
+                {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro"},
+                {"label": "PicoDrive", "so": "picodrive_libretro"},
             ],
         )
         fw = _make_firmware_service(romm_api=plugin._romm_api, core_info=core_info)
@@ -1304,7 +1306,7 @@ class TestDownloadRequiredFirmware:
         """
         from unittest.mock import AsyncMock, MagicMock
 
-        core_info = FakeCoreInfoProvider(active_core=("flycast_libretro.so", "Flycast"))
+        core_info = FakeCoreInfoProvider(active_core=("flycast_libretro", "Flycast"))
         resolver = FakeSystemResolver(mapping={"dc": "dreamcast"})
         fw = _make_firmware_service(core_info=core_info, resolve_system=resolver)
 
@@ -1317,12 +1319,13 @@ class TestDownloadRequiredFirmware:
                 "md5_hash": "",
             },
         ]
-        # Per-core required flag keyed on the active-core .so resolved via the system.
+        # Per-core required flag keyed on the active core (BARE, no ".so") resolved
+        # via the system — the bios registry keys its cores dict on bare names too.
         fw._bios_files_index = {
             "boot.bin": {
                 "description": "Boot",
                 "required": False,
-                "cores": {"flycast_libretro.so": {"required": True}},
+                "cores": {"flycast_libretro": {"required": True}},
                 "platform": "dc",
             },
         }
@@ -1346,7 +1349,7 @@ class TestDownloadRequiredFirmware:
         assert result["downloaded"] == 1
         assert download_called_ids == [1]
         # get_active_core received the NORMALIZED system, not the raw slug.
-        assert core_info.active_core_calls == [("dreamcast", None)]
+        assert core_info.active_core_calls == ["dreamcast"]
         assert resolver.calls == [("dc", None)]
 
     @pytest.mark.asyncio
@@ -1865,6 +1868,85 @@ class TestPerCoreFiltering:
         assert gb_file["used_by_active"] is False
 
 
+class TestCheckPlatformBiosPreResolvedCore:
+    """R8: ``check_platform_bios`` takes a pre-resolved ``active_core_so``.
+
+    The per-game game-detail path resolves the active ``.so`` upstream (folding
+    the ``emulator_override`` pin) and passes it in; the platform-level callers
+    pass ``None`` to mean "use the system default". The filter's ``required_count``
+    must follow the pre-resolved core, not the system default.
+    """
+
+    def _gba_two_core_service(self, fw, firmware_list):
+        """Wire a gba registry where gpSP requires gba_bios.bin and mGBA does not."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        fw._bios_registry = {
+            "platforms": {
+                "gba": {
+                    "gba_bios.bin": {
+                        "description": "GBA BIOS",
+                        "required": True,
+                        "firmware_path": "gba_bios.bin",
+                        "md5": "",
+                        "cores": {"mgba_libretro": {"required": False}, "gpsp_libretro": {"required": True}},
+                    },
+                },
+            },
+        }
+        fw._bios_files_index = {
+            "gba_bios.bin": {**fw._bios_registry["platforms"]["gba"]["gba_bios.bin"], "platform": "gba"},
+        }
+        fw._loop = MagicMock()
+        fw._loop.run_in_executor = AsyncMock(return_value=firmware_list)
+
+    @pytest.mark.asyncio
+    async def test_pre_resolved_core_drives_filter_over_system_default(self, fw, tmp_path):
+        """A passed-in ``active_core_so`` overrides the system default for required_count.
+
+        The system default (set on the fake) is mGBA — which treats gba_bios.bin as
+        optional. Passing the per-game override ``gpsp_libretro`` flips the file to
+        required, proving the pre-resolved core (not the system default) feeds the
+        filter and that ``get_active_core`` is NOT consulted when a core is supplied.
+        """
+        firmware_list = [
+            {"id": 1, "file_name": "gba_bios.bin", "file_path": "bios/gba/gba_bios.bin", "md5_hash": ""},
+        ]
+        self._gba_two_core_service(fw, firmware_list)
+        # System default = mGBA (optional). The per-game override should win.
+        fw._core_info.active_core = ("mgba_libretro", "mGBA")
+
+        with patch.object(fw, "_retrodeck_paths", FakeRetroDeckPaths(bios=str(tmp_path / "bios"))):
+            result = await fw.check_platform_bios("gba", active_core_so="gpsp_libretro")
+
+        assert result["needs_bios"] is True
+        assert result["required_count"] == 1  # gpSP requires gba_bios.bin
+        # The pre-resolved core short-circuits the system-default read entirely.
+        assert fw._core_info.active_core_calls == []
+
+    @pytest.mark.asyncio
+    async def test_none_falls_back_to_system_default(self, fw, tmp_path):
+        """``active_core_so=None`` resolves the system default via ``get_active_core``.
+
+        Same registry, no per-game core: the platform-level path reads the system
+        default (mGBA → optional) so ``required_count`` is 0 — the opposite of the
+        override case, locking in the result-flip.
+        """
+        firmware_list = [
+            {"id": 1, "file_name": "gba_bios.bin", "file_path": "bios/gba/gba_bios.bin", "md5_hash": ""},
+        ]
+        self._gba_two_core_service(fw, firmware_list)
+        fw._core_info.active_core = ("mgba_libretro", "mGBA")
+
+        with patch.object(fw, "_retrodeck_paths", FakeRetroDeckPaths(bios=str(tmp_path / "bios"))):
+            result = await fw.check_platform_bios("gba")
+
+        assert result["needs_bios"] is True
+        assert result["required_count"] == 0  # mGBA treats gba_bios.bin as optional
+        # None → the system default was read once for the system "gba".
+        assert fw._core_info.active_core_calls == ["gba"]
+
+
 class TestLoadBiosRegistryErrors:
     """Tests for load_bios_registry error handling."""
 
@@ -2260,10 +2342,10 @@ class TestCheckPlatformBiosCached:
             firmware_cache_epoch=1000.0,
         )
 
-        core_info.active_core = ("genesisplusgx_libretro.so", "Genesis Plus GX")
+        core_info.active_core = ("genesisplusgx_libretro", "Genesis Plus GX")
         core_info.available_cores = [
-            {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro.so"},
-            {"label": "PicoDrive", "so": "picodrive_libretro.so"},
+            {"label": "Genesis Plus GX", "so": "genesisplusgx_libretro"},
+            {"label": "PicoDrive", "so": "picodrive_libretro"},
         ]
         result = fw.check_platform_bios_cached("sms")
 
@@ -2289,8 +2371,8 @@ class TestCheckPlatformBiosCached:
             firmware_cache_epoch=42.0,
         )
 
-        core_info.active_core = ("mgba_libretro.so", "mGBA")
-        core_info.available_cores = [{"label": "mGBA", "so": "mgba_libretro.so"}]
+        core_info.active_core = ("mgba_libretro", "mGBA")
+        core_info.available_cores = [{"label": "mGBA", "so": "mgba_libretro"}]
         with patch.object(fw, "_retrodeck_paths", FakeRetroDeckPaths(bios=str(tmp_path))):
             result = fw.check_platform_bios_cached("gba")
 
@@ -2360,8 +2442,8 @@ class TestCheckPlatformBiosCached:
             bios_registry={"platforms": {slug: {"boot.bin": {"required": True, "md5": "abc"}}}},
             resolve_system=resolver,
         )
-        core_info.active_core = ("flycast_libretro.so", "Flycast")
-        core_info.available_cores = [{"label": "Flycast", "so": "flycast_libretro.so"}]
+        core_info.active_core = ("flycast_libretro", "Flycast")
+        core_info.available_cores = [{"label": "Flycast", "so": "flycast_libretro"}]
 
         with patch.object(fw, "_retrodeck_paths", FakeRetroDeckPaths(bios=str(tmp_path))):
             result = fw.check_platform_bios_cached(slug)
@@ -2371,7 +2453,7 @@ class TestCheckPlatformBiosCached:
         assert result["needs_bios"] is True
         assert result["server_count"] == 1
         # The active-core read seam received the NORMALIZED system.
-        assert core_info.active_core_calls == [(system, None)]
+        assert core_info.active_core_calls == [system]
         # The BIOS path no longer reads available cores at all.
         assert core_info.available_cores_calls == []
         assert resolver.calls == [(slug, None)]
@@ -2515,7 +2597,7 @@ class TestDeletePlatformBiosIOLogsWarnings:
         fake_files.remove_failures.add("/fake/bios/scph5501.bin")
         fw._firmware_file_store = fake_files
 
-        async def mock_check(slug, rom_filename=None):
+        async def mock_check(slug, active_core_so=None):
             return {
                 "needs_bios": True,
                 "files": [

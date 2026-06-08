@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from domain.save_extensions import get_save_extensions
 from domain.save_path import resolve_save_dir
-from domain.shortcut_data import build_launch_options, resolve_emulator_invocation
+from domain.shortcut_data import build_launch_options, label_to_core_so, resolve_emulator_invocation
 
 if TYPE_CHECKING:
     import logging
@@ -25,15 +25,18 @@ if TYPE_CHECKING:
 
     from models.state import SaveSortSettings
 
+    from domain.rom import Rom
     from domain.rom_install import RomInstall
     from services.protocols import (
+        ActiveCoreReader,
+        CoreInfoProvider,
         CoreNameProviderFn,
-        CoreResolverFn,
         EventEmitter,
         MigrationFileStore,
         RetroArchSaveSortingProvider,
         RetroDeckPaths,
         SettingsPersister,
+        SystemResolver,
         UnitOfWorkFactory,
     )
 
@@ -54,7 +57,9 @@ class MigrationServiceConfig:
     Holds the Protocol-typed migration-file adapter, the live settings
     dict, runtime infrastructure, persistence callbacks, event emitter,
     and the provider callables MigrationService needs at construction
-    time. Relational migration state (ROM installs, BIOS records, change
+    time. The ``core_info`` read seam + ``resolve_system`` resolver re-bake
+    each relocated ROM's ``emulator_override`` into ``launch_options``.
+    Relational migration state (ROM installs, BIOS records, change
     markers) is read through the injected ``uow_factory``.
     """
 
@@ -67,8 +72,10 @@ class MigrationServiceConfig:
     get_bios_files_index: Callable[[], dict[str, dict[str, Any]]]
     retrodeck_paths: RetroDeckPaths
     get_retroarch_save_sorting: RetroArchSaveSortingProvider
-    get_active_core: CoreResolverFn
+    active_core: ActiveCoreReader
     get_core_name: CoreNameProviderFn
+    core_info: CoreInfoProvider
+    resolve_system: SystemResolver
     uow_factory: UnitOfWorkFactory
 
 
@@ -85,8 +92,10 @@ class MigrationService:
         self._get_bios_files_index = config.get_bios_files_index
         self._retrodeck_paths = config.retrodeck_paths
         self._get_retroarch_save_sorting = config.get_retroarch_save_sorting
-        self._get_active_core = config.get_active_core
+        self._active_core = config.active_core
         self._get_core_name = config.get_core_name
+        self._core_info = config.core_info
+        self._resolve_system = config.resolve_system
         self._uow_factory = config.uow_factory
         # Strong refs to in-flight background tasks. ``loop.create_task``
         # alone is not enough — without a strong ref, the loop is free to
@@ -536,7 +545,7 @@ class MigrationService:
                 rom = uow.roms.get(install.rom_id)
                 if rom is None or rom.shortcut_app_id is None:
                     continue
-                invocation = resolve_emulator_invocation({"id": rom.rom_id})
+                invocation = resolve_emulator_invocation({"id": rom.rom_id}, self._relaunch_core_so(rom))
                 items.append(
                     {
                         "app_id": rom.shortcut_app_id,
@@ -544,6 +553,28 @@ class MigrationService:
                     }
                 )
         return items
+
+    def _relaunch_core_so(self, rom: Rom) -> str | None:
+        """Resolve *rom*'s ``emulator_override`` LABEL to a ``.so`` for the re-bake.
+
+        Returns the resolved ``.so`` so the migrated shortcut keeps the ``-e``
+        override, ``None`` when the ROM has no override (plain launch). A stale
+        LABEL that no longer resolves to a core degrades to the plain launch with
+        a WARNING — never a bogus ``None.so``.
+        """
+        label = rom.emulator_override
+        if label is None:
+            return None
+        system = self._resolve_system(rom.platform_slug)
+        core_so = label_to_core_so(self._core_info.get_available_cores(system), label)
+        if core_so is None:
+            self._logger.warning(
+                "migration: emulator override '%s' for rom_id=%s no longer resolves on %s; baking the plain launch",
+                label,
+                rom.rom_id,
+                system,
+            )
+        return core_so
 
     def _apply_relocations(self, installs, relocations, bios_files, bios_relocations, *, clear_marker):
         """Persist the relocated install and BIOS records (and optionally clear the marker).
@@ -685,22 +716,23 @@ class MigrationService:
             self._loop,
         )
 
-    def _resolve_retroarch_corename(self, system: str, rom_filename: str) -> tuple[str | None, str | None]:
-        """Resolve the RetroArch save subdirectory name for a system/ROM.
+    def _resolve_retroarch_corename(self, rom_id: int) -> tuple[str | None, str | None]:
+        """Resolve the RetroArch save subdirectory name for a ROM by ``rom_id``.
 
-        Asks ES-DE (via ``get_active_core``) **which** core is active,
+        Asks the per-ROM ``ActiveCoreReader`` **which** core is active (the
+        per-game ``emulator_override`` pin folded over the system default),
         then asks the RetroArch ``.info`` parser (via ``get_core_name``)
         **what** RetroArch calls that core in its own subsystem — which
         is what ``sort_savefiles_enable`` uses when naming save
         subdirectories.
 
         Returns a ``(corename, core_so)`` tuple. ``corename`` is ``None``
-        (fail loud, no ES-DE label fallback) when the providers cannot
-        resolve a core for this system/ROM. ``core_so`` is the underlying
+        (fail loud, no ES-DE label fallback) when the resolver cannot
+        resolve a core for this ROM. ``core_so`` is the underlying
         ES-DE core ``.so`` basename when known (useful for diagnostics
         when ``corename`` is ``None``), otherwise ``None``.
         """
-        core_so, _label = self._get_active_core(system, rom_filename)
+        core_so, _label = self._active_core.active_core_for_rom(rom_id)
         if not core_so:
             return (None, None)
         corename = self._get_core_name(core_so)
@@ -750,7 +782,7 @@ class MigrationService:
             return
         core_name: str | None = None
         if need_core:
-            core_name, core_so = self._resolve_retroarch_corename(system, os.path.basename(file_path))
+            core_name, core_so = self._resolve_retroarch_corename(install.rom_id)
             if core_name is None:
                 # Fail loud — cannot resolve the RetroArch corename for this ROM's
                 # active core, so we can't build the correct sort-by-core path.
