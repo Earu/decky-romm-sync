@@ -214,6 +214,72 @@ class TestV47SyncFlow:
         assert upload_calls[0][2]["device_id"] == "server-dev-123"
         assert upload_calls[0][2]["slot"] == "default"
 
+    def test_legacy_slot_uploads_as_null_not_default(self, tmp_path):
+        """#1061: a sync on the explicit legacy slot uploads slot=None (slot:null), not 'default'.
+
+        Regression: ``_resolve_upload_slot`` returned 'default' for
+        ``active_slot=None``, misfiling a save played on the legacy slot into the
+        default slot — so switching back to legacy found nothing on the server
+        and the local file had already been quarantined by the intervening switch.
+        """
+        svc, fake = make_service(tmp_path)
+        svc._config.settings["save_sync_enabled"] = True
+        _set_device_id(svc, "server-dev-123")
+        _install_rom(svc, tmp_path)
+        _create_save(tmp_path)
+        # Explicit legacy: active_slot=None with a populated slots dict — exactly
+        # the state after switching to the legacy slot via the saves tab.
+        _seed_save_state(
+            svc,
+            42,
+            RomSaveState(
+                system="gba",
+                active_slot=None,
+                slot_confirmed=True,
+                slots={"": {"source": "local", "count": 0, "latest_updated_at": None}},
+            ),
+        )
+
+        _do_sync(svc, 42)  # server has no saves in the slot → local file → Upload
+
+        upload_calls = [c for c in fake.call_log if c[0] == "upload_save"]
+        assert len(upload_calls) == 1
+        assert upload_calls[0][2]["slot"] is None  # legacy → slot:null, NOT "default"
+
+    def test_resolve_upload_slot_branches(self):
+        """_resolve_upload_slot maps each (active_slot, slots, device) case correctly."""
+        from services.saves.sync_engine.matrix import MatrixExecutor as M
+
+        # No device sync → always None.
+        assert M._resolve_upload_slot(RomSaveState(active_slot="desktop"), None, "default") is None
+        # Named active slot → that slot.
+        assert M._resolve_upload_slot(RomSaveState(active_slot="desktop"), "dev", "default") == "desktop"
+        # Brand-new ROM (active None, no slots) → the configured default slot.
+        assert M._resolve_upload_slot(RomSaveState(), "dev", "main") == "main"
+        # Explicit legacy (active None, slots populated) → None (slot:null), not default.
+        legacy = RomSaveState()
+        legacy.switch_active_slot(None)  # active=None, adds the "" slots key
+        assert M._resolve_upload_slot(legacy, "dev", "default") is None
+
+    def test_filter_server_saves_to_slot_isolates_legacy(self):
+        """#1061: a legacy (slot:null) save belongs ONLY to the legacy slot.
+
+        Regression for the on-device carry-over: the old filter matched a null
+        save under ANY named active slot (``slot == active or slot is None``), so
+        the legacy save bled into a named slot's status and got synced into it.
+        Exact slot membership keeps each slot isolated.
+        """
+        from services.saves.sync_engine.matrix import MatrixExecutor as M
+
+        saves = [{"id": 75, "slot": "default"}, {"id": 77, "slot": None}, {"id": 74, "slot": "default"}]
+        # Named slot the legacy save does NOT belong to → empty (no leak).
+        assert [s["id"] for s in M.filter_server_saves_to_slot(saves, "test")] == []
+        # Named slot → only its own saves, never the legacy null one.
+        assert [s["id"] for s in M.filter_server_saves_to_slot(saves, "default")] == [75, 74]
+        # Legacy mode (None or "") → only the null save.
+        assert [s["id"] for s in M.filter_server_saves_to_slot(saves, None)] == [77]
+        assert [s["id"] for s in M.filter_server_saves_to_slot(saves, "")] == [77]
+
     def test_v47_skip_when_is_current(self, tmp_path):
         """v4.7: server says is_current=True, local unchanged → skip."""
         svc, fake = make_service(tmp_path)

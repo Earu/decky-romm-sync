@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from domain.emulator_tag import build_emulator_tag
 from domain.rom_save_state import FileSyncState, RomSaveState
+from domain.save_slot import save_in_slot
 from domain.sync_action import (
     Conflict,
     Download,
@@ -259,13 +260,31 @@ class MatrixExecutor:
         return True
 
     @staticmethod
-    def _resolve_upload_slot(save_state: RomSaveState, device_id: str | None) -> str | None:
-        """The slot field to send with an upload; ``None`` when device sync is off."""
+    def _resolve_upload_slot(
+        save_state: RomSaveState, device_id: str | None, default_slot: str | None = None
+    ) -> str | None:
+        """The slot field to send with an upload; ``None`` when device sync is off.
+
+        With device sync on, a named ``active_slot`` uploads to that slot. An
+        ``active_slot`` of ``None`` is ambiguous and must be disambiguated by the
+        ``slots`` map (the same signal :meth:`update_file_sync_state` uses to seed
+        the active slot):
+
+        - **Explicit legacy** (``active_slot`` None but ``slots`` populated — the
+          state after switching to / confirming the legacy slot) → ``None`` so the
+          save is POSTed as ``slot:null``. Returning ``"default"`` here misfiled a
+          legacy save into the default slot (#1061).
+        - **Brand-new ROM** (``active_slot`` None and ``slots`` empty — never
+          configured) → the configured ``default_slot`` so its first sync lands in
+          the default slot, matching the active-slot seeding.
+        """
         if not device_id:
             return None
         if save_state.active_slot is not None:
             return save_state.active_slot
-        return "default"
+        if save_state.slots:
+            return None
+        return default_slot or "default"
 
     def _confirm_upload_sync(self, upload_id: int | None, device_id: str | None) -> None:
         """Ack the uploaded save on the server's DeviceSaveSync row (non-fatal)."""
@@ -302,7 +321,7 @@ class MatrixExecutor:
         emulator = build_emulator_tag(core_so)
 
         # v4.7: pass device_id and slot
-        slot = self._resolve_upload_slot(save_state, device_id)
+        slot = self._resolve_upload_slot(save_state, device_id, default_slot)
 
         result = self._retry.with_retry(
             lambda: self._romm_api.upload_save(
@@ -351,14 +370,16 @@ class MatrixExecutor:
     def filter_server_saves_to_slot(
         server_saves: list[dict[str, Any]], active_slot: str | None
     ) -> list[dict[str, Any]]:
-        """Filter server saves to the active slot.
+        """Filter server saves to the active slot by exact slot membership.
 
-        Saves with ``slot=None`` (legacy/no-slot) are accepted under any active
-        slot; in legacy mode (no active slot) we only keep saves without a slot.
+        A legacy (``slot:null`` / ``""``) save belongs ONLY to the legacy slot —
+        it is never surfaced under a named slot. Sharing
+        :func:`domain.save_slot.save_in_slot` keeps the sync matrix, the status
+        display, and rollback consistent with the per-slot read/delete paths
+        (#1061): the legacy save is visible and syncable only in legacy mode, so
+        it can't bleed into a named slot's status or get downloaded into it.
         """
-        if active_slot:
-            return [ss for ss in server_saves if ss.get("slot") == active_slot or ss.get("slot") is None]
-        return [ss for ss in server_saves if not ss.get("slot")]
+        return [ss for ss in server_saves if save_in_slot(ss, active_slot)]
 
     def _build_local_input(self, local_path: str, filename: str) -> dict[str, Any]:
         """Build the dict shape consumed by ``compute_sync_action``."""
