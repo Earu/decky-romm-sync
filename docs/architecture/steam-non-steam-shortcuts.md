@@ -67,6 +67,26 @@ it. The sync engine processes removals before additions to minimise churn.
 
 See: `src/utils/steamShortcuts.ts`
 
+### appId reuse across a server switch / re-import
+
+Because the appId is `CRC32(exe + name)` and both are **stable for a given ROM across syncs** (the exe is the constant
+`…/bin/rom-launcher`, the name is the RomM `name`), the same game always hashes to the **same appId** — even after its
+server-issued `rom_id` changes. Switching the RomM server URL (or re-importing on the same server) reissues `rom_id`s;
+the `roms` rows survive (ADR-0007 retention) and the new `rom_id` for an unchanged game resolves to the appId the old
+`rom_id` already holds.
+
+Two guards keep this from wiping a freshly-synced shortcut (`#1036`):
+
+- **One appId, one bound row.** `SqliteRomRepository.save()` unbinds any sibling row holding the appId before the
+  per-`rom_id` UPSERT, and migration `003`'s partial unique index on `shortcut_app_id` enforces it (see
+  [Database Design](database-design.md)). A re-import never leaves two bound rows sharing one appId.
+- **Stale-removal excludes appIds bound this run.** The finalize stale pass flags bound rows whose `rom_id` wasn't
+  synced this run — which includes the old colliding `rom_id`. `domain/sync_diff.py:select_stale_removals` removes any
+  candidate whose appId is in the run's `committed_app_ids` (every appId bound this run, across both the happy-path and
+  the heartbeat-timeout late-ack commit paths), so the appId the run just bound to the new `rom_id` is never emitted for
+  removal. The `get_by_app_id` reverse lookup orders `rom_id DESC LIMIT 1` so it resolves the live (newest) binding for
+  any pre-migration edge state.
+
 ## BIsModOrShortcut
 
 Non-Steam shortcuts return `BIsModOrShortcut() = true` by default. This is their natural state — Steam uses this flag to
@@ -215,3 +235,25 @@ write is observable rather than assumed. Only `exe`/name changes still need dele
 
 When creating multiple shortcuts in a loop, a 50ms delay between each `addShortcut()` call prevents corrupting Steam's
 internal shortcut state. Without this delay, some shortcuts may silently fail to register.
+
+### A per-unit heartbeat timeout must not discard the unit's delivered bindings
+
+The per-unit apply pipeline emits `sync_apply_unit`, then waits for the frontend's `report_unit_results` ack. If the
+frontend stops heartbeating for longer than the per-unit timeout (`_UNIT_HEARTBEAT_TIMEOUT_SEC`, 60s — e.g. a unit
+large/slow enough that real heartbeats lag), the wait gives up. But by then the frontend has **already created the Steam
+shortcuts** and will still fire its late `report_unit_results`. Dropping that ack is data loss: the bindings are never
+written to `roms`, so `get_app_id_rom_id_map` doesn't know about the shortcuts, and the next sync re-creates them as
+**duplicates** (an unmapped exe-detected shortcut takes the `addShortcut` branch).
+
+So a heartbeat **timeout** is handled differently from a **user cancel** (#1052):
+
+- **User cancel** — in-flight work is intentionally discarded. The orchestrator clears `pending_sync` and nulls
+  `unit_complete_event`, so a stray late ack can't commit a cancelled unit.
+- **Heartbeat timeout** — the orchestrator keeps `pending_sync`, flags `unit_abandoned`, and stashes the unit's ROMs in
+  `pending_unit_roms`. The late `report_unit_results` observes the flag and drives `commit_unit_results` itself,
+  persisting the delivered bindings (and metadata from the stash). Do **not** re-clear `pending_sync` on timeout — that
+  re-opens the orphan/duplicate loop.
+
+The committed binding self-heals the duplicate hazard: a bound `roms` row is mapped by `getExistingRomMShortcuts` next
+sync, so `resolveShortcutAppId` takes the update branch. The orchestrator does **not** add active orphan deletion — a
+Steam shortcut is the sole record of its tile (the "never delete data that exists nowhere else" invariant).

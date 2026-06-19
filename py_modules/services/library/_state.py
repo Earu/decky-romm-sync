@@ -57,12 +57,32 @@ class LibrarySyncStateBox:
     # :meth:`SyncReporter.report_unit_results` when the frontend reports
     # back for the active unit; the orchestrator awaits it (with a
     # heartbeat-based timeout) before dispatching the next unit. Cleared
-    # back to None between units.
+    # back to None between units. On a heartbeat **timeout** (not a user
+    # cancel) the orchestrator does NOT clear ``pending_sync`` or null
+    # ``unit_complete_event`` — it flags ``unit_abandoned`` instead, so a
+    # late ``report_unit_results`` can still commit the delivered bindings
+    # that the frontend already created Steam shortcuts for (#1052).
     unit_complete_event: asyncio.Event | None = None
     # Holds the frontend-supplied ``rom_id_to_app_id`` mapping reported
     # for the active unit. Surfaces the result so the orchestrator can
     # accumulate the per-unit registry into the cross-run accumulators.
     last_unit_results: dict[str, int] | None = None
+    # Set True when a per-unit wait times out on a stale heartbeat (not a
+    # user cancel): the orchestrator abandoned the unit but the frontend
+    # may still ack it. A late :meth:`SyncReporter.report_unit_results`
+    # observes this flag and drives the per-unit commit itself so the
+    # delivered bindings are persisted rather than discarded (#1052).
+    unit_abandoned: bool = False
+    # The abandoned unit's live RomM fetch (the source of each ROM's
+    # ``metadatum``), stashed so a late ack can rebuild ``acked_roms`` for
+    # the commit it drives. Reset between units alongside ``last_unit_results``.
+    pending_unit_roms: list[dict[str, Any]] = field(default_factory=list)
+    # Every Steam appId bound by a ``commit_unit_results`` this run, across
+    # BOTH the happy path and the heartbeat-timeout late-ack path (#1052).
+    # The stale-removal scan excludes these so a new server-issued rom_id that
+    # reuses an old appId (CRC32 of unchanged exe+name) can't wipe the shortcut
+    # the run just bound (#1036). Reset at the start of each run.
+    committed_app_ids: set[int] = field(default_factory=set)
 
     def is_cancelling(self) -> bool:
         """True while a cancel has been requested for the in-flight run."""
