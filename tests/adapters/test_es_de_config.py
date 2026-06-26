@@ -434,7 +434,9 @@ class TestGetDefaultEmulator:
     def test_standalone_pref_prefers_live_es_systems_command(self):
         resolver = _make_resolver()
         defaults = {
-            "ps3": {"standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --bundled %ROM%"}}
+            "ps3": {
+                "standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --bundled %ROM%"}
+            }
         }
         live = {"ps3": {"commands": {"RPCS3 Directory (Standalone)": "%EMULATOR_RPCS3% --no-gui %ROM%"}}}
         with (
@@ -450,7 +452,9 @@ class TestGetDefaultEmulator:
     def test_standalone_pref_falls_back_to_bundled_command(self):
         resolver = _make_resolver()
         defaults = {
-            "ps3": {"standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --no-gui %ROM%"}}
+            "ps3": {
+                "standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --no-gui %ROM%"}
+            }
         }
         # es_systems.xml absent (or lacks the curated label) → bundled command.
         with (

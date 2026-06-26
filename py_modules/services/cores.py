@@ -248,9 +248,7 @@ class CoreService:
             uow.roms.set_emulator_override(rom_id, rom.emulator_override)
             # The picker only offers libretro cores, so a pinned override is a
             # libretro invocation built from the just-resolved .so.
-            launch_options, app_id = self._launch_options_for(
-                uow, rom, EmulatorInvocation.libretro(core_so, label)
-            )
+            launch_options, app_id = self._launch_options_for(uow, rom, EmulatorInvocation.libretro(core_so, label))
         return {"success": True, "launch_options": launch_options, "app_id": app_id}
 
     async def clear_game_core(self, rom_id: int) -> dict[str, Any]:

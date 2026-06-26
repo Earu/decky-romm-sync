@@ -491,9 +491,7 @@ class DownloadService:
             cleanup=lambda: self._download_file_store.remove_file(target_path),
         )
 
-    def _resolve_bound_app_id(
-        self, rom_id: int, file_path: str
-    ) -> tuple[int | None, EmulatorInvocation | None, str]:
+    def _resolve_bound_app_id(self, rom_id: int, file_path: str) -> tuple[int | None, EmulatorInvocation | None, str]:
         """Return the ROM's ``(shortcut_app_id, emulator, bake_path)`` for the re-bake.
 
         Reads the ROM + its fresh install record in a short read UoW, then
@@ -719,9 +717,7 @@ class DownloadService:
                 "platform_name": platform_name,
                 "file_path": final_path,
                 "app_id": app_id,
-                "launch_options": build_launch_options(
-                    resolve_emulator_invocation(rom_detail, emulator), bake_path
-                ),
+                "launch_options": build_launch_options(resolve_emulator_invocation(rom_detail, emulator), bake_path),
                 "resumable": entry.get("resumable", False),
             },
         )
