@@ -11,8 +11,8 @@ which emulator a game uses, where that decision is stored, and how it is applied
 The central rule: **the read-path core equals the launched core.** Whatever core the plugin reports for a game — in the
 BIOS-requirement filter, the save-directory name, the save-sync core tag, the core-change warning, the game-detail badge
 — is the exact core that game will launch on. A single resolver guarantees that, and the launch command is baked from
-the same resolved emulator. The plugin **owns emulator selection end to end**: it reads RetroDECK/ES-DE configuration for
-the default emulator, but its own launches never depend on ES-DE's `gamelist.xml` — it neither reads nor writes that
+the same resolved emulator. The plugin **owns emulator selection end to end**: it reads RetroDECK/ES-DE configuration
+for the default emulator, but its own launches never depend on ES-DE's `gamelist.xml` — it neither reads nor writes that
 file. See
 [ADR-0011](https://github.com/danielcopper/decky-romm-sync/blob/main/docs/adr/0011-per-game-core-override-in-db-applied-via-e-flag.md)
 (the per-game DB override + `-e`) and
@@ -94,9 +94,9 @@ this ROM actually launch with?" It exposes two methods over the **same** four-la
 - **`active_emulator_for_rom(rom_id) -> EmulatorInvocation | None`** — the **launch-bake seam**. Returns the full
   resolved emulator (libretro core OR standalone), or `None` when the platform has no resolvable emulator at all.
 - **`active_core_for_rom(rom_id) -> (core_so, label)`** — the **read-path projection** of the above, kept for the
-  `.so`-space consumers. A libretro emulator yields `(core_so, label)`; a **standalone** emulator yields `(None, label)`;
-  an unresolvable platform yields `(None, None)`. Consumers already degrade on a `None` core, so a standalone launch
-  never breaks them.
+  `.so`-space consumers. A libretro emulator yields `(core_so, label)`; a **standalone** emulator yields
+  `(None, label)`; an unresolvable platform yields `(None, None)`. Consumers already degrade on a `None` core, so a
+  standalone launch never breaks them.
 
 The precedence is the invariant:
 
@@ -128,9 +128,9 @@ active_core_for_rom(rom_id):                               ── the .so-space 
 
 The system-layer fallback is `CoreResolver.get_default_emulator(system)` (`adapters/es_de_config.py`), the
 **standalone-aware** layer: if `core_defaults.json` marks the system with a curated `standalone` block it bakes that
-emulator (see [Standalone-emulator selection](#standalone-emulator-selection-the-curated-default)), otherwise it projects
-the libretro `get_active_core(system)` default (live `es_systems.xml` default with bundled `core_defaults.json` as
-fallback). It **no longer reads any gamelist** — neither a per-game `<altemulator>` nor a system-level
+emulator (see [Standalone-emulator selection](#standalone-emulator-selection-the-curated-default)), otherwise it
+projects the libretro `get_active_core(system)` default (live `es_systems.xml` default with bundled `core_defaults.json`
+as fallback). It **no longer reads any gamelist** — neither a per-game `<altemulator>` nor a system-level
 `<alternativeEmulator>`; the gamelist is off every plugin code path. The per-platform deviation that used to live in the
 gamelist is now the `settings.json` layer above. A pinned per-game or per-platform LABEL that no longer resolves (a core
 a RetroDECK update removed) is **never fatal**: the resolver logs a WARNING and degrades to the next layer, never
@@ -202,13 +202,12 @@ filename (see
 **Always `-e`.** Per
 [ADR-0012](https://github.com/danielcopper/decky-romm-sync/blob/main/docs/adr/0012-plugin-owns-core-selection-always-e-no-gamelist.md),
 every installed ROM bakes its **full resolved active emulator** through `-e` — the per-game pin, the per-platform core,
-the es_systems libretro default, or a standalone emulator, whichever the resolver returns. The plain `flatpak run` launch
-is **not** the "no override" case any more; it is reserved for the single fallback where the resolver yields `None` (a
-platform with no resolvable default at all). Baking the default for every ROM is what lets the plugin own launch
-selection completely: a launch that
-is _not_ `-e` would let RetroDECK consult the gamelist, re-coupling the plugin to ES-DE's state. The cost is that a
-RetroDECK update changing a platform's default core needs a **Force Full Sync** to re-bake — see
-[A frozen default needs a Force Full Sync](#a-frozen-default-needs-a-force-full-sync).
+the es_systems libretro default, or a standalone emulator, whichever the resolver returns. The plain `flatpak run`
+launch is **not** the "no override" case any more; it is reserved for the single fallback where the resolver yields
+`None` (a platform with no resolvable default at all). Baking the default for every ROM is what lets the plugin own
+launch selection completely: a launch that is _not_ `-e` would let RetroDECK consult the gamelist, re-coupling the
+plugin to ES-DE's state. The cost is that a RetroDECK update changing a platform's default core needs a **Force Full
+Sync** to re-bake — see [A frozen default needs a Force Full Sync](#a-frozen-default-needs-a-force-full-sync).
 
 ### The three bake sites
 
@@ -216,11 +215,11 @@ RetroDECK update changing a platform's default core needs a **Force Full Sync** 
 emulator** through the same `ActiveCoreResolver.active_emulator_for_rom` seam and pass the `EmulatorInvocation` into
 `resolve_emulator_invocation`, so the read-path core and the launched emulator cannot diverge:
 
-| Bake site                                    | When it runs                             | How it resolves the emulator                                                          |
-| -------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------- |
+| Bake site                                    | When it runs                             | How it resolves the emulator                                                             |
+| -------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `SyncOrchestrator` → `_build_core_overrides` | every sync (preview + apply)             | each ROM through `active_emulator_for_rom` → `{rom_id: EmulatorInvocation}` for the bake |
-| `DownloadService` → `_resolve_bound_app_id`  | on download-complete (install/reinstall) | the ROM through `active_emulator_for_rom` in the same flow                             |
-| `MigrationService` → `_build_relaunch_items` | on RetroDECK-home migration              | each relocated ROM through `active_emulator_for_rom`                                   |
+| `DownloadService` → `_resolve_bound_app_id`  | on download-complete (install/reinstall) | the ROM through `active_emulator_for_rom` in the same flow                               |
+| `MigrationService` → `_build_relaunch_items` | on RetroDECK-home migration              | each relocated ROM through `active_emulator_for_rom`                                     |
 
 The download-complete bake is the one that re-applies a pin after reinstall — the exact path `roms` storage was chosen
 to protect. Each site bakes `-e` for every ROM that resolves to a concrete emulator (libretro or standalone), and the
@@ -305,8 +304,8 @@ path-override layering the `-e` core override uses.
 
 The three sites that re-bake the core override re-bake the disc path through this seam, and the two compose: the disc
 resolver yields the **path**, `ActiveCoreResolver` yields the **`EmulatorInvocation`**, and
-`resolve_emulator_invocation(rom, emulator)` + `build_launch_options(invocation, disc_path)` fold them into one command —
-a per-game core (or standalone emulator) and a pinned disc on the same shortcut coexist.
+`resolve_emulator_invocation(rom, emulator)` + `build_launch_options(invocation, disc_path)` fold them into one command
+— a per-game core (or standalone emulator) and a pinned disc on the same shortcut coexist.
 
 | Bake site                                                              | How it resolves the disc path                                                             |
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -424,10 +423,10 @@ The `-e` flag, the `%EMULATOR_RETROARCH%` / `%ROM%` placeholders, and the `/var/
 **RetroDECK-adapter concerns**, isolated at the single seam `resolve_emulator_invocation`. RetroDECK is the supported
 launcher for V1 — this is the correct V1 shape, not a placeholder. The per-ROM **selection** (which emulator does this
 ROM resolve to?) is a service-layer read; the seam only **renders** the chosen `EmulatorInvocation` into a command
-string. Standalone-emulator support ([#129](https://github.com/danielcopper/decky-romm-sync/issues/129)) is the
-first half of the multi-emulator lift: a standalone emulator is still launched **through RetroDECK's `-e`**, so the
-RetroDECK flatpak invocation remains the single seam — only the `-e` payload changed (a verbatim ES-DE command instead
-of the RetroArch `-L` form). The remaining lift ([#918](https://github.com/danielcopper/decky-romm-sync/issues/918)) — a
+string. Standalone-emulator support ([#129](https://github.com/danielcopper/decky-romm-sync/issues/129)) is the first
+half of the multi-emulator lift: a standalone emulator is still launched **through RetroDECK's `-e`**, so the RetroDECK
+flatpak invocation remains the single seam — only the `-e` payload changed (a verbatim ES-DE command instead of the
+RetroArch `-L` form). The remaining lift ([#918](https://github.com/danielcopper/decky-romm-sync/issues/918)) — a
 non-RetroDECK launcher behind a `Frontend`-style port — is net-new work and is not built until a second launcher is
 concrete.
 
