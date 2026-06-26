@@ -32,6 +32,19 @@ class TestResolveEmulatorInvocation:
         assert result == RETRODECK_INVOCATION
         assert "-e" not in result
 
+    def test_unrenderable_invocation_degrades_to_plain(self):
+        # A non-None but half-resolved invocation (standalone without a command,
+        # libretro without a core_so, or an unknown kind) must never reach the
+        # f-string and bake a broken -e — it degrades to the plain launch.
+        for emulator in (
+            EmulatorInvocation(kind="standalone", command=None),
+            EmulatorInvocation(kind="libretro", core_so=None),
+            EmulatorInvocation(kind="unknown"),
+        ):
+            result = resolve_emulator_invocation({"id": 1}, emulator)
+            assert result == RETRODECK_INVOCATION
+            assert "-e" not in result
+
     def test_one_arg_default_has_no_override(self):
         assert "-e" not in resolve_emulator_invocation({"id": 1})
 
@@ -278,7 +291,9 @@ class TestBuildShortcutsData:
     def test_installed_rom_absent_from_overrides_is_plain(self):
         # A rom_id NOT in core_overrides follows the default — plain launch, no -e.
         roms = [{"id": 1, "name": "Plain"}]
-        result = build_shortcuts_data(roms, "/plugin", {1: "/roms/n64/g.z64"}, {2: EmulatorInvocation.libretro("other_libretro")})
+        result = build_shortcuts_data(
+            roms, "/plugin", {1: "/roms/n64/g.z64"}, {2: EmulatorInvocation.libretro("other_libretro")}
+        )
         assert result[0]["launch_options"] == 'flatpak run net.retrodeck.retrodeck "/roms/n64/g.z64"'
         assert "-e" not in result[0]["launch_options"]
 
