@@ -17,6 +17,7 @@ from fakes.fake_core_info_provider import FakeCoreInfoProvider
 from fakes.fake_unit_of_work import FakeUnitOfWork, FakeUnitOfWorkFactory
 
 from domain.rom import Rom
+from domain.shortcut_data import EmulatorInvocation
 from services.active_core_resolver import ActiveCoreResolver, ActiveCoreResolverConfig
 
 if TYPE_CHECKING:
@@ -323,3 +324,72 @@ def test_missing_rom_resolves_to_none_with_warning(caplog: pytest.LogCaptureFixt
     assert core_info.active_core_calls == []
     assert platform_reader.calls == []
     assert any("404" in r.message for r in caplog.records)
+
+
+# --- active_emulator_for_rom: the standalone-aware launch-bake seam (#129) ------
+
+
+def test_standalone_system_default_resolves_to_standalone_emulator() -> None:
+    """An un-pinned ROM on a standalone-emulator platform (PS3) resolves to the
+    standalone :class:`EmulatorInvocation`, not a libretro core."""
+    uow = FakeUnitOfWork()
+    _seed_rom(uow, rom_id=50, platform_slug="ps3", emulator_override=None)
+    rpcs3 = EmulatorInvocation.standalone("%EMULATOR_RPCS3% --no-gui %ROM%", "RPCS3 Directory (Standalone)")
+    core_info = FakeCoreInfoProvider(standalone={"ps3": rpcs3})
+    resolver, _ = _make_resolver(uow=uow, core_info=core_info)
+
+    assert resolver.active_emulator_for_rom(50) == rpcs3
+    # A standalone emulator has no libretro core — the .so-space projection is
+    # (None, label) so read-path consumers degrade exactly as for (None, None).
+    assert resolver.active_core_for_rom(50) == (None, "RPCS3 Directory (Standalone)")
+
+
+def test_per_game_pin_beats_standalone_system_default() -> None:
+    """A per-game libretro pin wins over a platform's standalone default — the
+    launch-bake seam returns the libretro invocation."""
+    uow = FakeUnitOfWork()
+    _seed_rom(uow, rom_id=51, platform_slug="ps2", emulator_override="LRPS2")
+    core_info = FakeCoreInfoProvider(
+        available_cores=[{"core_so": "pcsx2_libretro", "label": "LRPS2", "is_default": False}],
+        standalone={"ps2": EmulatorInvocation.standalone("%EMULATOR_PCSX2% -batch %ROM%", "PCSX2 (Standalone)")},
+    )
+    resolver, _ = _make_resolver(uow=uow, core_info=core_info)
+
+    assert resolver.active_emulator_for_rom(51) == EmulatorInvocation.libretro("pcsx2_libretro", "LRPS2")
+
+
+def test_per_platform_core_beats_standalone_system_default() -> None:
+    """A per-platform libretro core wins over the standalone system default."""
+    uow = FakeUnitOfWork()
+    _seed_rom(uow, rom_id=52, platform_slug="ps2", emulator_override=None)
+    core_info = FakeCoreInfoProvider(
+        available_cores=[{"core_so": "pcsx2_libretro", "label": "LRPS2", "is_default": False}],
+        standalone={"ps2": EmulatorInvocation.standalone("%EMULATOR_PCSX2% -batch %ROM%", "PCSX2 (Standalone)")},
+    )
+    platform_reader = FakePlatformCoreReader(mapping={"ps2": "LRPS2"})
+    resolver, _ = _make_resolver(uow=uow, core_info=core_info, platform_core_reader=platform_reader)
+
+    assert resolver.active_emulator_for_rom(52) == EmulatorInvocation.libretro("pcsx2_libretro", "LRPS2")
+
+
+def test_resolvable_pin_returns_libretro_invocation() -> None:
+    """The launch-bake seam returns a libretro invocation for a resolvable pin."""
+    uow = FakeUnitOfWork()
+    _seed_rom(uow, rom_id=53, platform_slug="gba", emulator_override="mGBA")
+    core_info = FakeCoreInfoProvider(
+        available_cores=[{"core_so": "mgba_libretro", "label": "mGBA", "is_default": True}],
+    )
+    resolver, _ = _make_resolver(uow=uow, core_info=core_info)
+
+    assert resolver.active_emulator_for_rom(53) == EmulatorInvocation.libretro("mgba_libretro", "mGBA")
+
+
+def test_unresolvable_platform_returns_none() -> None:
+    """A platform with no libretro default and no standalone pref resolves to None
+    — the bake site falls back to the plain launch."""
+    uow = FakeUnitOfWork()
+    _seed_rom(uow, rom_id=54, platform_slug="unknown", emulator_override=None)
+    core_info = FakeCoreInfoProvider(active_core=(None, None))
+    resolver, _ = _make_resolver(uow=uow, core_info=core_info)
+
+    assert resolver.active_emulator_for_rom(54) is None

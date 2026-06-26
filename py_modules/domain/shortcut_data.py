@@ -6,6 +6,7 @@ No I/O, no imports from services, adapters, or lib.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 # The emulator invocation prefix the launch command wraps the resolved ROM
@@ -18,27 +19,71 @@ RETRODECK_INVOCATION = "flatpak run net.retrodeck.retrodeck"
 _RETROARCH_CORES_DIR = "/var/config/retroarch/cores"
 
 
-def resolve_emulator_invocation(rom: dict[str, Any], active_core_so: str | None = None) -> str:
+@dataclass(frozen=True)
+class EmulatorInvocation:
+    """What a ROM launches with — a RetroArch libretro core OR a standalone emulator.
+
+    The plugin resolves one of these per ROM and bakes it into the shortcut's
+    ``launch_options`` via :func:`resolve_emulator_invocation`. Exactly one of
+    ``core_so`` / ``command`` carries the payload:
+
+    - ``kind == "libretro"`` → ``core_so`` is the BARE core name (no ``.so``); the
+      renderer emits the RetroArch ``-L <coresdir>/<so>.so %ROM%`` form (the cores
+      dir is baked literally because RetroDECK does not expand ``%CORE_RETROARCH%``
+      through ``-e``).
+    - ``kind == "standalone"`` → ``command`` is the full ES-DE ``<command>`` text
+      (already ending in ``%ROM%``, e.g. ``%EMULATOR_RPCS3% --no-gui %ROM%``),
+      baked verbatim into ``-e``. RetroDECK resolves ``%EMULATOR_*%`` and
+      substitutes ``%ROM%`` with the trailing rom path at launch — the same path
+      the libretro form relies on.
+
+    ``label`` is the ES-DE display label (diagnostics only). This is the
+    standalone-emulator seam (#129); read-path consumers that only understand
+    libretro keep reading ``core_so`` (``None`` for a standalone emulator) and
+    degrade exactly as they do for a ``(None, None)`` resolution.
+    """
+
+    kind: str  # "libretro" | "standalone"
+    label: str | None = None
+    core_so: str | None = None
+    command: str | None = None
+
+    @classmethod
+    def libretro(cls, core_so: str, label: str | None = None) -> EmulatorInvocation:
+        """A RetroArch libretro core, identified by its bare ``.so`` name."""
+        return cls(kind="libretro", label=label, core_so=core_so)
+
+    @classmethod
+    def standalone(cls, command: str, label: str | None = None) -> EmulatorInvocation:
+        """A standalone emulator, identified by its full ES-DE ``<command>`` text."""
+        return cls(kind="standalone", label=label, command=command)
+
+
+def resolve_emulator_invocation(rom: dict[str, Any], emulator: EmulatorInvocation | None = None) -> str:
     """Return the emulator invocation prefix for *rom*.
 
-    With ``active_core_so`` unset (``None``) the ROM follows the RetroDECK/ES-DE
-    default and resolves to the plain RetroDECK flatpak command. With a bare core
-    name it returns the RetroDECK ``-e`` override that forces that RetroArch core:
-    ``flatpak run … -e "%EMULATOR_RETROARCH% -L <cores>/<so>.so %ROM%"``. The
-    cores dir is baked literally; ``%EMULATOR_RETROARCH%`` and ``%ROM%`` remain
-    ES-DE placeholders. *rom* is the per-emulator-branch seam (#129) and is
-    ignored today.
+    With *emulator* unset (``None``) the ROM follows the plain RetroDECK flatpak
+    command (the single genuine fallback for a platform with no resolvable
+    emulator). A **libretro** invocation renders the RetroDECK ``-e`` override that
+    forces that RetroArch core:
+    ``flatpak run … -e "%EMULATOR_RETROARCH% -L <cores>/<so>.so %ROM%"`` (cores dir
+    literal; ``%EMULATOR_RETROARCH%`` / ``%ROM%`` stay ES-DE placeholders). A
+    **standalone** invocation bakes the emulator's full ES-DE command verbatim:
+    ``flatpak run … -e "<command … %ROM%>"`` (e.g. ``%EMULATOR_RPCS3% --no-gui
+    %ROM%``) — RetroDECK resolves ``%EMULATOR_*%`` and substitutes ``%ROM%`` at
+    launch. *rom* is the per-emulator-branch seam and is ignored today.
     """
     del rom  # reserved for the future per-emulator branch
-    # B4: branch on None explicitly so None never reaches the f-string (no
-    # "None.so"); an unresolvable override degrades to the plain launch upstream.
-    if active_core_so is None:
+    # Branch explicitly so a half-resolved invocation never reaches the f-string
+    # (no "None.so" / empty -e); anything unrenderable degrades to the plain launch.
+    if emulator is None:
         return RETRODECK_INVOCATION
-    # active_core_so is the BARE core name (no extension) — the es_systems parser
-    # captures the name without ".so" (regex group excludes the suffix), and both
-    # core_defaults.json and the bios registry key on bare names too. Append the
-    # ".so" here for the on-disk RetroArch core path that retroarch's -L expects.
-    return f'{RETRODECK_INVOCATION} -e "%EMULATOR_RETROARCH% -L {_RETROARCH_CORES_DIR}/{active_core_so}.so %ROM%"'
+    if emulator.kind == "standalone" and emulator.command:
+        return f'{RETRODECK_INVOCATION} -e "{emulator.command}"'
+    if emulator.kind == "libretro" and emulator.core_so:
+        # The bare core name + ".so" forms the on-disk RetroArch core path -L expects.
+        return f'{RETRODECK_INVOCATION} -e "%EMULATOR_RETROARCH% -L {_RETROARCH_CORES_DIR}/{emulator.core_so}.so %ROM%"'
+    return RETRODECK_INVOCATION
 
 
 def label_to_core_so(available_cores: list[dict[str, Any]], label: str) -> str | None:
@@ -73,7 +118,7 @@ def build_shortcuts_data(
     roms: list[dict[str, Any]],
     plugin_dir: str,
     installed_paths: dict[int, str],
-    core_overrides: dict[int, str],
+    core_overrides: dict[int, EmulatorInvocation],
 ) -> list[dict[str, Any]]:
     """Transform ROM list into shortcut data dicts for frontend AddShortcut calls.
 
@@ -81,12 +126,14 @@ def build_shortcuts_data(
     installed ROM gets a full launch command in ``launch_options``; a ROM absent
     from the map gets ``""`` (empty placeholder) until it is downloaded.
 
-    *core_overrides* maps ``rom_id`` to the **already-resolved** ``.so`` filename
-    of a per-game emulator override — only ROMs whose ``emulator_override`` LABEL
-    resolved to a real core appear (the caller omits stale ones with a WARNING).
-    A ROM absent from the map follows the RetroDECK/ES-DE default (plain launch,
-    no ``-e``); a present ROM bakes the ``-e`` override into ``launch_options``.
-    Required so a new bake site can never silently skip the override.
+    *core_overrides* maps ``rom_id`` to the **already-resolved**
+    :class:`EmulatorInvocation` the ROM launches with (its full active emulator —
+    libretro core or standalone — folding the per-game/per-platform override over
+    the es_systems default). Only ROMs that resolved to an emulator appear (the
+    caller omits the ``(None, None)`` fallback); a ROM absent from the map follows
+    the plain RetroDECK launch, a present ROM bakes its ``-e`` form into
+    ``launch_options``. Required so a new bake site can never silently skip the
+    override.
     """
     exe = os.path.join(plugin_dir, "bin", "rom-launcher")
     start_dir = os.path.join(plugin_dir, "bin")

@@ -383,7 +383,7 @@ class TestClearGameCore:
         assert result["app_id"] == 99
         # The resolver was consulted AFTER the pin cleared, and the bake uses its
         # resolved core (the per-platform default) with the -e override form.
-        assert active_core.calls == [42]
+        assert active_core.emulator_calls == [42]
         assert result["launch_options"] == (
             "flatpak run net.retrodeck.retrodeck -e "
             '"%EMULATOR_RETROARCH% -L /var/config/retroarch/cores/bsnes_libretro.so %ROM%" '
@@ -517,7 +517,7 @@ class TestSetSystemCoreFanOut:
         app_ids = [item["app_id"] for item in result["rebake_items"]]
         assert app_ids == [101]
         # The overridden ROM's resolver is never consulted.
-        assert active_core.calls == [1]
+        assert active_core.emulator_calls == [1]
 
     def test_skips_uninstalled_rom(self, event_loop, service, uow, active_core):
         # Bound but NOT installed → no live launch command to rewrite.

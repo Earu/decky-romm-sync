@@ -34,6 +34,7 @@ from adapters.persistence import (
     PersistenceAdapter,
 )
 from domain.preview_delta import PreviewDelta
+from domain.shortcut_data import EmulatorInvocation
 from domain.sync_state import SyncState
 from domain.work_unit import WorkUnit
 
@@ -221,7 +222,7 @@ class TestBuildCoreOverrides:
     """
 
     def test_resolved_override_included_null_omitted(self, plugin):
-        """A resolvable pin maps to its BARE core name; a ROM with no pin is absent."""
+        """A resolvable pin maps to its libretro EmulatorInvocation; an unpinned ROM is absent."""
         plugin._core_info.available_cores = [
             {"core_so": "pcsx_rearmed_libretro", "label": "PCSX ReARMed", "is_default": True},
         ]
@@ -233,7 +234,7 @@ class TestBuildCoreOverrides:
         roms = [{"id": 10, "platform_slug": "psx"}, {"id": 11, "platform_slug": "psx"}]
         result = plugin._sync_service._orchestrator._build_core_overrides(roms)
 
-        assert result == {10: "pcsx_rearmed_libretro"}
+        assert result == {10: EmulatorInvocation.libretro("pcsx_rearmed_libretro", "PCSX ReARMed")}
         assert 11 not in result
 
     def test_stale_override_omitted_with_warning(self, plugin, caplog):

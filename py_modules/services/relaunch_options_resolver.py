@@ -75,8 +75,8 @@ class RelaunchOptionsResolver:
         multi-disc ROM bakes its selected disc's path, a single-disc ROM its own
         ``file_path``.
         """
-        core_so, _label = self._active_core.active_core_for_rom(rom.rom_id)
-        invocation = resolve_emulator_invocation({"id": rom.rom_id}, core_so)
+        emulator = self._active_core.active_emulator_for_rom(rom.rom_id)
+        invocation = resolve_emulator_invocation({"id": rom.rom_id}, emulator)
         bake_path = self._disc_resolver.resolve_for_install(install, rom.selected_disc)
         return {
             "app_id": rom.shortcut_app_id,

@@ -5,6 +5,7 @@ import shlex
 
 from domain.shortcut_data import (
     RETRODECK_INVOCATION,
+    EmulatorInvocation,
     build_launch_options,
     build_shortcuts_data,
     label_to_core_so,
@@ -38,7 +39,7 @@ class TestResolveEmulatorInvocation:
         # Byte-exact golden -e string: literal cores dir, preserved %…% placeholders.
         # The core name is BARE (no extension) as the es_systems parser yields it;
         # the bake appends exactly one ".so" for the on-disk RetroArch core path.
-        result = resolve_emulator_invocation({"id": 1}, "pcsx_rearmed_libretro")
+        result = resolve_emulator_invocation({"id": 1}, EmulatorInvocation.libretro("pcsx_rearmed_libretro"))
         assert result == (
             "flatpak run net.retrodeck.retrodeck "
             '-e "%EMULATOR_RETROARCH% -L /var/config/retroarch/cores/pcsx_rearmed_libretro.so %ROM%"'
@@ -48,18 +49,33 @@ class TestResolveEmulatorInvocation:
         # Regression for the on-device crash: the bake appended no ".so" and the
         # fakes hid it by passing ".so"-suffixed names. With the real bare name
         # the baked -L path must carry exactly one ".so" — not zero, not two.
-        result = resolve_emulator_invocation({"id": 1}, "pcsx_rearmed")
+        result = resolve_emulator_invocation({"id": 1}, EmulatorInvocation.libretro("pcsx_rearmed"))
         assert "/var/config/retroarch/cores/pcsx_rearmed.so" in result
         assert "pcsx_rearmed.so.so" not in result
         assert "/cores/pcsx_rearmed %ROM%" not in result
 
     def test_core_so_uses_literal_cores_dir_and_keeps_placeholders(self):
-        result = resolve_emulator_invocation({"id": 1}, "pcsx_rearmed_libretro")
+        result = resolve_emulator_invocation({"id": 1}, EmulatorInvocation.libretro("pcsx_rearmed_libretro"))
         assert "/var/config/retroarch/cores" in result
         assert "%EMULATOR_RETROARCH%" in result
         assert "%ROM%" in result
         # The cores dir is baked literally; %CORE_RETROARCH% is NOT used.
         assert "%CORE_RETROARCH%" not in result
+
+    def test_standalone_bakes_command_verbatim(self):
+        # A standalone emulator's full ES-DE <command> (already ending in %ROM%) is
+        # baked verbatim into -e; RetroDECK expands %EMULATOR_*% and %ROM% at launch.
+        result = resolve_emulator_invocation(
+            {"id": 1}, EmulatorInvocation.standalone("%EMULATOR_RPCS3% --no-gui %ROM%")
+        )
+        assert result == 'flatpak run net.retrodeck.retrodeck -e "%EMULATOR_RPCS3% --no-gui %ROM%"'
+        # No libretro -L form leaks in for a standalone emulator.
+        assert "-L " not in result
+        assert "%CORE_RETROARCH%" not in result
+
+    def test_standalone_ps2_batch_form(self):
+        result = resolve_emulator_invocation({"id": 1}, EmulatorInvocation.standalone("%EMULATOR_PCSX2% -batch %ROM%"))
+        assert result == 'flatpak run net.retrodeck.retrodeck -e "%EMULATOR_PCSX2% -batch %ROM%"'
 
     def test_none_never_yields_none_so(self):
         # B4 guard: a None core must never reach the f-string as the literal "None.so".
@@ -166,7 +182,7 @@ class TestBuildLaunchOptions:
         ]
 
     def test_override_invocation_is_preserved_unescaped(self):
-        invocation = resolve_emulator_invocation({"id": 1}, "mgba")
+        invocation = resolve_emulator_invocation({"id": 1}, EmulatorInvocation.libretro("mgba"))
         path = '/roms/gba/Game".gba'
         result = build_launch_options(invocation, path)
         # The invocation's own -e "..." quoting is part of the trusted prefix and
@@ -236,24 +252,40 @@ class TestBuildShortcutsData:
     def test_installed_rom_with_core_override_bakes_e_form(self):
         # A rom_id present in core_overrides bakes the -e override into its launch.
         roms = [{"id": 1, "name": "PSX Game"}]
-        result = build_shortcuts_data(roms, "/plugin", {1: "/roms/psx/game.chd"}, {1: "pcsx_rearmed_libretro"})
+        result = build_shortcuts_data(
+            roms, "/plugin", {1: "/roms/psx/game.chd"}, {1: EmulatorInvocation.libretro("pcsx_rearmed_libretro")}
+        )
         assert result[0]["launch_options"] == (
             "flatpak run net.retrodeck.retrodeck "
             '-e "%EMULATOR_RETROARCH% -L /var/config/retroarch/cores/pcsx_rearmed_libretro.so %ROM%" '
             '"/roms/psx/game.chd"'
         )
 
+    def test_installed_rom_with_standalone_override_bakes_e_form(self):
+        # A standalone emulator override bakes its verbatim ES-DE command into -e.
+        roms = [{"id": 1, "name": "PS3 Game"}]
+        result = build_shortcuts_data(
+            roms,
+            "/plugin",
+            {1: "/roms/ps3/game/PS3_GAME/USRDIR/EBOOT.BIN"},
+            {1: EmulatorInvocation.standalone("%EMULATOR_RPCS3% --no-gui %ROM%")},
+        )
+        assert result[0]["launch_options"] == (
+            'flatpak run net.retrodeck.retrodeck -e "%EMULATOR_RPCS3% --no-gui %ROM%" '
+            '"/roms/ps3/game/PS3_GAME/USRDIR/EBOOT.BIN"'
+        )
+
     def test_installed_rom_absent_from_overrides_is_plain(self):
         # A rom_id NOT in core_overrides follows the default — plain launch, no -e.
         roms = [{"id": 1, "name": "Plain"}]
-        result = build_shortcuts_data(roms, "/plugin", {1: "/roms/n64/g.z64"}, {2: "other_libretro"})
+        result = build_shortcuts_data(roms, "/plugin", {1: "/roms/n64/g.z64"}, {2: EmulatorInvocation.libretro("other_libretro")})
         assert result[0]["launch_options"] == 'flatpak run net.retrodeck.retrodeck "/roms/n64/g.z64"'
         assert "-e" not in result[0]["launch_options"]
 
     def test_uninstalled_rom_with_override_still_empty(self):
         # An override on an UNINSTALLED rom can't bake — no path, empty placeholder.
         roms = [{"id": 1, "name": "NotDownloaded"}]
-        result = build_shortcuts_data(roms, "/plugin", {}, {1: "pcsx_rearmed_libretro"})
+        result = build_shortcuts_data(roms, "/plugin", {}, {1: EmulatorInvocation.libretro("pcsx_rearmed_libretro")})
         assert result[0]["launch_options"] == ""
 
     def test_empty_roms(self):

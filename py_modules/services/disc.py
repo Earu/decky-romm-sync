@@ -175,5 +175,5 @@ class DiscService:
         keeps it from nesting on the same SQLite connection.
         """
         bake_path = self._disc_resolver.resolve_bake_path(install, discs, selected_disc)
-        core_so, _label = self._active_core.active_core_for_rom(rom_id)
-        return build_launch_options(resolve_emulator_invocation({"id": rom_id}, core_so), bake_path)
+        emulator = self._active_core.active_emulator_for_rom(rom_id)
+        return build_launch_options(resolve_emulator_invocation({"id": rom_id}, emulator), bake_path)

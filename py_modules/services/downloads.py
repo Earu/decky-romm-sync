@@ -25,7 +25,7 @@ from domain.rom_files import (
     resolve_local_file_name,
 )
 from domain.rom_install import RomInstall
-from domain.shortcut_data import build_launch_options, resolve_emulator_invocation
+from domain.shortcut_data import EmulatorInvocation, build_launch_options, resolve_emulator_invocation
 from lib.errors import error_response
 from lib.list_result import ErrorCode
 from lib.path_safety import PathTraversalError, safe_join
@@ -491,23 +491,25 @@ class DownloadService:
             cleanup=lambda: self._download_file_store.remove_file(target_path),
         )
 
-    def _resolve_bound_app_id(self, rom_id: int, file_path: str) -> tuple[int | None, str | None, str]:
-        """Return the ROM's ``(shortcut_app_id, active_core_so, bake_path)`` for the re-bake.
+    def _resolve_bound_app_id(
+        self, rom_id: int, file_path: str
+    ) -> tuple[int | None, EmulatorInvocation | None, str]:
+        """Return the ROM's ``(shortcut_app_id, emulator, bake_path)`` for the re-bake.
 
         Reads the ROM + its fresh install record in a short read UoW, then
-        resolves the ROM's FULL active core through the shared ``active_core``
+        resolves the ROM's FULL active emulator through the shared ``active_core``
         resolver and the multi-disc launch path through the shared
         ``disc_resolver`` so ``download_complete`` re-bakes the right launch
         command. ``app_id`` is ``None`` when the ROM has no Steam shortcut yet
         (not synced) — the frontend no-ops and the next sync writes the launch
-        command. ``active_core_so`` is the resolved ``.so`` when the ROM's
-        per-game/per-platform/system resolution yields a core (bake the ``-e``
-        form), ``None`` when it resolves to ``(None, None)`` — a genuinely
-        unresolvable platform (bake the plain launch). ``bake_path`` is the
-        selected disc's path for a multi-disc ROM (the persisted pick survives
+        command. ``emulator`` is the resolved :class:`EmulatorInvocation` (libretro
+        core or standalone) when the ROM's per-game/per-platform/system resolution
+        yields one (bake the ``-e`` form), ``None`` when it resolves to nothing — a
+        genuinely unresolvable platform (bake the plain launch). ``bake_path`` is
+        the selected disc's path for a multi-disc ROM (the persisted pick survives
         uninstall → reinstall, just like the core override), or *file_path*
         unchanged for a single-disc ROM. The resolver already warns + degrades on
-        a stale label/pin, so no bogus ``None.so`` or missing-disc path ever
+        a stale label/pin, so no bogus invocation or missing-disc path ever
         reaches the bake. This is the load-bearing site: the per-game override and
         the disc pin both live on ``roms`` so they survive uninstall → reinstall,
         and reinstall goes through here.
@@ -518,14 +520,14 @@ class DownloadService:
             selected_disc = rom.selected_disc if rom is not None else None
         if rom is None:
             return (None, None, file_path)
-        core_so, _label = self._active_core.active_core_for_rom(int(rom_id))
+        emulator = self._active_core.active_emulator_for_rom(int(rom_id))
         # The install record was committed just before this read, so it is
         # present in the normal flow; guard for the rare race where it is not and
         # fall back to the raw download path (no multi-disc resolution possible).
         bake_path = (
             self._disc_resolver.resolve_for_install(install, selected_disc) if install is not None else file_path
         )
-        return (rom.shortcut_app_id, core_so, bake_path)
+        return (rom.shortcut_app_id, emulator, bake_path)
 
     def _make_progress_callback(self, rom_id, rom_name, platform_name, file_name, control=None):
         """Build a throttled progress callback for a download."""
@@ -706,7 +708,7 @@ class DownloadService:
         entry = self._download_queue[rom_id]
         entry["status"] = "completed"
         entry["progress"] = 1.0
-        app_id, active_core_so, bake_path = await self._loop.run_in_executor(
+        app_id, emulator, bake_path = await self._loop.run_in_executor(
             None, self._resolve_bound_app_id, rom_id, final_path
         )
         await self._emit(
@@ -718,7 +720,7 @@ class DownloadService:
                 "file_path": final_path,
                 "app_id": app_id,
                 "launch_options": build_launch_options(
-                    resolve_emulator_invocation(rom_detail, active_core_so), bake_path
+                    resolve_emulator_invocation(rom_detail, emulator), bake_path
                 ),
                 "resumable": entry.get("resumable", False),
             },
