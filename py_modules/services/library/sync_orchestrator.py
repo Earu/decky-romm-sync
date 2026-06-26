@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from domain.preview_delta import PreviewDelta
-from domain.shortcut_data import build_shortcuts_data
+from domain.shortcut_data import EmulatorInvocation, build_shortcuts_data
 from domain.sync_diff import (
     classify_roms,
     compute_collection_diff,
@@ -901,24 +901,24 @@ class SyncOrchestrator:
             stale_rom_ids=[rom_id for rom_id, _app_id in stale],
         )
 
-    def _build_core_overrides(self, roms: list[dict[str, Any]]) -> dict[int, str]:
-        """Resolve each ROM's FULL active core to its ``.so`` for the bake.
+    def _build_core_overrides(self, roms: list[dict[str, Any]]) -> dict[int, EmulatorInvocation]:
+        """Resolve each ROM's FULL active emulator for the bake.
 
         Runs every ROM in *roms* through the shared per-ROM ``active_core``
-        resolver (the single read-path seam that folds the per-game
-        ``emulator_override`` and per-platform ``settings.json`` core over the
-        es_systems default). Only ROMs that resolve to a non-``None`` core appear
-        in the returned ``{rom_id: core_so}`` map, so :func:`build_shortcuts_data`
-        bakes the ``-e`` override for them; a ROM that resolves to ``(None,
-        None)`` (a genuinely unresolvable platform) is absent and falls back to
-        the plain launch. The resolver already warns + degrades on a stale label,
-        so no bogus ``None.so`` ever reaches the bake.
+        resolver (the single seam that folds the per-game ``emulator_override``
+        and per-platform ``settings.json`` core over the standalone-aware
+        es_systems default). Only ROMs that resolve to an emulator (libretro core
+        or standalone) appear in the returned ``{rom_id: EmulatorInvocation}``
+        map, so :func:`build_shortcuts_data` bakes their ``-e`` form; a ROM that
+        resolves to nothing (a genuinely unresolvable platform) is absent and
+        falls back to the plain launch. The resolver already warns + degrades on
+        a stale label, so no bogus invocation ever reaches the bake.
         """
-        resolved: dict[int, str] = {}
+        resolved: dict[int, EmulatorInvocation] = {}
         for rom in roms:
-            core_so, _label = self._active_core.active_core_for_rom(rom["id"])
-            if core_so is not None:
-                resolved[rom["id"]] = core_so
+            emulator = self._active_core.active_emulator_for_rom(rom["id"])
+            if emulator is not None:
+                resolved[rom["id"]] = emulator
         return resolved
 
     def _scan_installed_paths(self) -> dict[int, str]:

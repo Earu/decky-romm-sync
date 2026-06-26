@@ -17,6 +17,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from adapters.flatpak_install import flatpak_app_files_dirs
+from domain.shortcut_data import EmulatorInvocation
 
 if TYPE_CHECKING:
     import logging
@@ -111,6 +112,39 @@ class CoreResolver:
             return (default_info["default_core"], default_info.get("default_label"))
 
         return (None, None)
+
+    def get_default_emulator(self, system_name: str) -> EmulatorInvocation | None:
+        """Resolve the system-layer default **emulator** (libretro OR standalone).
+
+        Some systems (PS2, PS3, …) launch on a **standalone** emulator, not a
+        RetroArch core, so the libretro-only :meth:`get_active_core` cannot
+        describe them. This is the standalone-aware system layer:
+
+        1. If ``core_defaults.json`` marks this system with a curated
+           ``standalone`` preference (``{"label", "command"}``), bake that
+           emulator — preferring the **live** ``es_systems.xml`` command text for
+           that label (so a RetroDECK update is picked up) and falling back to the
+           bundled command. A curated label is needed because ES-DE's *first*
+           command isn't always the right one to bake (e.g. PS3's first command is
+           the shortcut form, not the direct ``--no-gui`` launch).
+        2. Otherwise fall back to the libretro default (:meth:`get_active_core`).
+        3. ``None`` when neither resolves — the caller bakes the plain launch.
+
+        Keeps the read-path/launch-path invariant: the resolved emulator is both
+        what the ROM launches with and what derived values key on.
+        """
+        defaults = self._load_core_defaults()
+        pref = defaults.get(system_name, {}).get("standalone")
+        if pref and pref.get("label"):
+            live = self._load_es_systems().get(system_name)
+            command = (live or {}).get("commands", {}).get(pref["label"]) or pref.get("command")
+            if command:
+                return EmulatorInvocation.standalone(command, pref["label"])
+
+        core_so, label = self.get_active_core(system_name)
+        if core_so:
+            return EmulatorInvocation.libretro(core_so, label)
+        return None
 
     def get_available_cores(self, system_name):
         """Return available RetroArch cores for a system.
@@ -214,6 +248,8 @@ class CoreResolver:
                 "default_label": None,
                 "cores": {},
                 "label_to_core": {},
+                "commands": {},
+                "first_command_label": None,
                 "extensions": set(),
             }
         elif name == "command":
@@ -236,12 +272,25 @@ class CoreResolver:
 
     @staticmethod
     def _handle_es_command_end(state, sys, text):
-        """Handle </command> inside a <system> — extract core info."""
+        """Handle </command> inside a <system> — capture the command + any core info.
+
+        Records EVERY ``<command>`` (libretro AND standalone) as ``label →
+        command text`` in ``commands``, and remembers the FIRST command's label
+        (ES-DE's true default emulator) in ``first_command_label``. Standalone
+        commands (PCSX2, RPCS3, …) carry no ``%CORE_RETROARCH%/<core>.so`` token,
+        so they don't populate the libretro ``cores`` / ``default_core`` maps —
+        those stay libretro-only for the BIOS/save/menu read-paths — but their
+        command text is now available for the standalone launch bake.
+        """
+        label = state["current_label"]
+        sys["commands"][label] = text
+        if sys["first_command_label"] is None:
+            sys["first_command_label"] = label
+
         match = _CORE_SO_RE.search(text)
         if not match:
             return
         core_so = match.group(1)
-        label = state["current_label"]
         sys["cores"][core_so] = label
         sys["label_to_core"][label] = core_so
         if sys["default_core"] is None:
@@ -258,6 +307,8 @@ class CoreResolver:
                 "default_label": sys["default_label"],
                 "cores": sys["cores"],
                 "label_to_core": sys["label_to_core"],
+                "commands": sys["commands"],
+                "first_command_label": sys["first_command_label"],
                 "extensions": sys["extensions"],
             }
         state["current_system"] = None
@@ -289,8 +340,12 @@ class CoreResolver:
 
         Returns: ``{system_name: {"default_core": str | None, "default_label":
         str | None, "cores": {core_so: label}, "label_to_core": {label:
-        core_so}, "extensions": set[str]}}``. ``extensions`` holds the
-        lowercased ``<extension>`` tokens ES-DE uses to decide directory-collapse.
+        core_so}, "commands": {label: command_text}, "first_command_label": str |
+        None, "extensions": set[str]}}``. ``cores``/``default_core`` are
+        libretro-only; ``commands`` holds every ``<command>`` (libretro AND
+        standalone) and ``first_command_label`` is ES-DE's true default emulator.
+        ``extensions`` holds the lowercased ``<extension>`` tokens ES-DE uses to
+        decide directory-collapse.
 
         Returns empty dict if file can't be parsed or fails structural validation.
         """

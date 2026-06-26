@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from domain.shortcut_data import (
+    EmulatorInvocation,
     build_launch_options,
     label_to_core_so,
     resolve_emulator_invocation,
@@ -163,8 +164,8 @@ class CoreService:
                 install = uow.rom_installs.get(rom.rom_id)
                 if install is None:
                     continue
-                core_so, _label = self._active_core.active_core_for_rom(rom.rom_id)
-                invocation = resolve_emulator_invocation({}, core_so)
+                emulator = self._active_core.active_emulator_for_rom(rom.rom_id)
+                invocation = resolve_emulator_invocation({}, emulator)
                 # Fold the ROM's persisted disc pick over the install so a
                 # per-platform core change re-bakes the pinned disc, not disc 1 /
                 # the m3u. A single-disc ROM resolves to its own file_path. The
@@ -245,7 +246,11 @@ class CoreService:
             # write path (never the sync UPSERT).
             rom.pin_emulator_override(label)
             uow.roms.set_emulator_override(rom_id, rom.emulator_override)
-            launch_options, app_id = self._launch_options_for(uow, rom, core_so)
+            # The picker only offers libretro cores, so a pinned override is a
+            # libretro invocation built from the just-resolved .so.
+            launch_options, app_id = self._launch_options_for(
+                uow, rom, EmulatorInvocation.libretro(core_so, label)
+            )
         return {"success": True, "launch_options": launch_options, "app_id": app_id}
 
     async def clear_game_core(self, rom_id: int) -> dict[str, Any]:
@@ -276,24 +281,24 @@ class CoreService:
             rom.clear_emulator_override()
             uow.roms.set_emulator_override(rom_id, rom.emulator_override)
             # Cleared pin → follow the per-platform/system default. Resolve the
-            # ROM's full active core AFTER the NULL lands so a per-platform core
-            # still bakes its -e override (not a plain launch).
-            core_so, _label = self._active_core.active_core_for_rom(rom_id)
-            launch_options, app_id = self._launch_options_for(uow, rom, core_so)
+            # ROM's full active emulator AFTER the NULL lands so a per-platform
+            # core (or a standalone system default) still bakes its -e form.
+            emulator = self._active_core.active_emulator_for_rom(rom_id)
+            launch_options, app_id = self._launch_options_for(uow, rom, emulator)
         return {"success": True, "launch_options": launch_options, "app_id": app_id}
 
     def _launch_options_for(
         self,
         uow: UnitOfWork,
         rom: Rom,
-        active_core_so: str | None,
+        emulator: EmulatorInvocation | None,
     ) -> tuple[str | None, int | None]:
-        """Bake the launch command for *rom* with *active_core_so*, or ``(None, None)``.
+        """Bake the launch command for *rom* with *emulator*, or ``(None, None)``.
 
         An installed (``RomInstall`` with a ``file_path``) **and** bound
         (``shortcut_app_id`` set) ROM gets the full launch command — the ``-e``
-        override form when ``active_core_so`` is set, the plain form when it is
-        ``None`` — over the disc-resolved bake path (the ROM's persisted
+        form when *emulator* is set (libretro core or standalone), the plain form
+        when it is ``None`` — over the disc-resolved bake path (the ROM's persisted
         ``selected_disc`` for a multi-disc ROM, its ``file_path`` unchanged for a
         single-disc ROM), paired with its Steam ``app_id``. An uninstalled or
         unbound ROM has no live shortcut to update, so both are ``None`` and the
@@ -305,7 +310,7 @@ class CoreService:
         install = uow.rom_installs.get(rom.rom_id)
         if install is None:
             return (None, None)
-        invocation = resolve_emulator_invocation({}, active_core_so)
+        invocation = resolve_emulator_invocation({}, emulator)
         # Fold the ROM's persisted disc pick over the install so a per-game core
         # pin/clear re-bakes the pinned disc, not disc 1 / the m3u. A single-disc
         # ROM resolves to its own file_path. *rom* is already loaded in the open

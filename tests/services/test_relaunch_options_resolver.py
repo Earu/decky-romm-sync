@@ -132,7 +132,7 @@ def test_core_override_bakes_e_form():
             ),
         }
     ]
-    assert active_core.calls == [1]
+    assert active_core.emulator_calls == [1]
 
 
 def test_multiple_installs_yield_multiple_items():
@@ -241,7 +241,7 @@ def test_single_rom_core_override_bakes_e_form():
             f'"{file_path}"'
         ),
     }
-    assert active_core.calls == [1]
+    assert active_core.emulator_calls == [1]
 
 
 def test_single_rom_no_install_row_returns_none():

@@ -963,12 +963,20 @@
       "default_label": "LRPS2",
       "cores": {
         "pcsx2_libretro": "PCSX2"
+      },
+      "standalone": {
+        "label": "PCSX2 (Standalone)",
+        "command": "%EMULATOR_PCSX2% -batch %ROM%"
       }
     },
     "ps3": {
       "default_core": null,
       "default_label": null,
-      "cores": {}
+      "cores": {},
+      "standalone": {
+        "label": "RPCS3 Directory (Standalone)",
+        "command": "%EMULATOR_RPCS3% --no-gui %ROM%"
+      }
     },
     "psp": {
       "default_core": "ppsspp_libretro",

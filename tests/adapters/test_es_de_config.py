@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 
 from adapters.es_de_config import CoreResolver
+from domain.shortcut_data import EmulatorInvocation
 
 # conftest.py patches decky before this import.
 # main.py adds py_modules to sys.path (provides vdf, etc.).
@@ -216,6 +217,44 @@ class TestParseEsSystems:
         finally:
             os.unlink(path)
 
+    def test_every_command_captured_including_standalone(self, resolver):
+        # The standalone seam (#129): ``commands`` records EVERY <command> by
+        # label, libretro AND standalone — even the ones excluded from ``cores``.
+        path = _write_temp_xml(SAMPLE_ES_SYSTEMS_XML)
+        try:
+            result = resolver.parse_es_systems(path)
+            gba = result["gba"]
+            assert set(gba["commands"]) == {"mGBA", "gpSP", "VBA-M", "mGBA Standalone"}
+            # The standalone command text is preserved verbatim for the bake.
+            assert gba["commands"]["mGBA Standalone"] == "%EMULATOR_MGBA% %ROM%"
+        finally:
+            os.unlink(path)
+
+    def test_first_command_label_records_es_de_default_emulator(self, resolver):
+        # ``first_command_label`` is ES-DE's true default emulator — the FIRST
+        # <command>, even when that command is a standalone (no %CORE_RETROARCH%).
+        xml = """\
+<?xml version="1.0"?>
+<systemList>
+  <system>
+    <name>ps2</name>
+    <command label="PCSX2 (Standalone)">%EMULATOR_PCSX2% -batch %ROM%</command>
+    <command label="LRPS2">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/pcsx2_libretro.so %ROM%</command>
+  </system>
+</systemList>
+"""
+        path = _write_temp_xml(xml)
+        try:
+            result = resolver.parse_es_systems(path)
+            ps2 = result["ps2"]
+            # ES-DE's default emulator is the standalone, but the libretro
+            # ``default_core`` capture stays the first LIBRETRO command.
+            assert ps2["first_command_label"] == "PCSX2 (Standalone)"
+            assert ps2["default_core"] == "pcsx2_libretro"
+            assert ps2["commands"]["PCSX2 (Standalone)"] == "%EMULATOR_PCSX2% -batch %ROM%"
+        finally:
+            os.unlink(path)
+
 
 # A realistic multi-platform excerpt mirroring RetroDECK's shipped es_systems.xml
 # (linux/). The first RetroArch %CORE_RETROARCH% command per system is the
@@ -381,6 +420,72 @@ class TestGetActiveCore:
         ):
             result = resolver.get_active_core("totally_unknown_system")
         assert result == (None, None)
+
+
+class TestGetDefaultEmulator:
+    """The standalone-aware system layer (#129).
+
+    A system with a curated ``standalone`` block in ``core_defaults.json`` bakes
+    that emulator (preferring the live ``es_systems.xml`` command for the curated
+    label, falling back to the bundled command); a system without one projects
+    the libretro ``get_active_core`` default; an unresolvable system → ``None``.
+    """
+
+    def test_standalone_pref_prefers_live_es_systems_command(self):
+        resolver = _make_resolver()
+        defaults = {
+            "ps3": {"standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --bundled %ROM%"}}
+        }
+        live = {"ps3": {"commands": {"RPCS3 Directory (Standalone)": "%EMULATOR_RPCS3% --no-gui %ROM%"}}}
+        with (
+            mock.patch.object(CoreResolver, "_load_core_defaults", return_value=defaults),
+            mock.patch.object(CoreResolver, "_load_es_systems", return_value=live),
+        ):
+            result = resolver.get_default_emulator("ps3")
+        # Live command for the curated label wins over the bundled fallback.
+        assert result == EmulatorInvocation.standalone(
+            "%EMULATOR_RPCS3% --no-gui %ROM%", "RPCS3 Directory (Standalone)"
+        )
+
+    def test_standalone_pref_falls_back_to_bundled_command(self):
+        resolver = _make_resolver()
+        defaults = {
+            "ps3": {"standalone": {"label": "RPCS3 Directory (Standalone)", "command": "%EMULATOR_RPCS3% --no-gui %ROM%"}}
+        }
+        # es_systems.xml absent (or lacks the curated label) → bundled command.
+        with (
+            mock.patch.object(CoreResolver, "_load_core_defaults", return_value=defaults),
+            mock.patch.object(CoreResolver, "_load_es_systems", return_value={}),
+        ):
+            result = resolver.get_default_emulator("ps3")
+        assert result == EmulatorInvocation.standalone(
+            "%EMULATOR_RPCS3% --no-gui %ROM%", "RPCS3 Directory (Standalone)"
+        )
+
+    def test_no_standalone_pref_projects_libretro_default(self):
+        resolver = _make_resolver()
+        live = {
+            "gba": {
+                "default_core": "mgba_libretro",
+                "default_label": "mGBA",
+                "cores": {"mgba_libretro": "mGBA"},
+            }
+        }
+        with (
+            mock.patch.object(CoreResolver, "_load_core_defaults", return_value={}),
+            mock.patch.object(CoreResolver, "_load_es_systems", return_value=live),
+        ):
+            result = resolver.get_default_emulator("gba")
+        assert result == EmulatorInvocation.libretro("mgba_libretro", "mGBA")
+
+    def test_unresolvable_system_returns_none(self):
+        resolver = _make_resolver()
+        with (
+            mock.patch.object(CoreResolver, "_load_core_defaults", return_value={}),
+            mock.patch.object(CoreResolver, "_load_es_systems", return_value={}),
+        ):
+            result = resolver.get_default_emulator("totally_unknown_system")
+        assert result is None
 
 
 class TestGetAvailableCores:

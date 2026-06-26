@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from domain.save_layout import SaveLayout
+    from domain.shortcut_data import EmulatorInvocation
     from lib.retrodeck_health import RetroDeckConfigHealth
 
 
@@ -77,6 +78,8 @@ class CoreInfoProvider(Protocol):
     """
 
     def get_active_core(self, system_name: str) -> tuple[str | None, str | None]: ...
+
+    def get_default_emulator(self, system_name: str) -> EmulatorInvocation | None: ...
 
     def get_available_cores(self, system_name: str) -> list[dict[str, Any]]: ...
 
